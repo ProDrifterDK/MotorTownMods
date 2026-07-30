@@ -105,6 +105,12 @@ class PinnedUE4SSSourceCompatibilityTests(unittest.TestCase):
         self.assertNotIn("GetCharArray", fstr_branch)
         self.assertNotIn("to_string(str).c_str()", fstr_branch)
 
+    def test_fstring_conversions_do_not_pass_tarray_storage_to_to_string(self):
+        for relative_path in ("src/statics.cpp", "src/dllmain.cpp"):
+            with self.subTest(relative_path=relative_path):
+                source = (ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertNotIn("GetCharArray()", source)
+
 
 if __name__ == "__main__":
     unittest.main()

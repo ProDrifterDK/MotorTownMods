@@ -239,13 +239,14 @@ void ModStatics::ExportPropertyAsTable(
 			FString value;
 			auto propertyValue = property->ContainerPtrToValuePtr<void>(data);
 			property->ExportTextItem(value, propertyValue, nullptr, static_cast<UObject*>(data), 0);
+			const auto str = to_string(*value);
 			switch (propertyType)
 			{
 			case PropertyType::Array:
-				table.add_value(to_string(value.GetCharArray()).c_str());
+				table.add_value(str.c_str());
 				break;
 			default:
-				table.add_pair(propName.c_str(), to_string(value.GetCharArray()).c_str());
+				table.add_pair(propName.c_str(), str.c_str());
 			}
 		}
 		else
