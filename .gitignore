@@ -1,1 +1,3 @@
 *.dll
+__pycache__/
+*.pyc

@@ -1,6 +1,6 @@
 local projectName = "MotorTownMods"
 
-add_requires("boost",  { debug = is_mode_debug(), configs = {runtimes = get_mode_runtimes(), all = true} , system = false})
+add_requires("boost 1.88.0",  { debug = is_mode_debug(), configs = {runtimes = get_mode_runtimes(), all = true} , system = false})
 
 target(projectName)
     add_rules("ue4ss.mod")

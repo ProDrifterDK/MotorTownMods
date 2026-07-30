@@ -53,7 +53,7 @@ public:
 	static std::wstring GetModName() { return L"MotorTownMods"; }
 
 	// Get current mod version
-	static std::wstring GetVersion() { return L"0.1.0"; }
+	static std::wstring GetVersion() { return L"0.12.0-b1088.1"; }
 
 	static int GetLogLevel();
 
