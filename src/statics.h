@@ -1,7 +1,9 @@
 #pragma once
 
+#include <map>
 #include <string>
 #include <DynamicOutput/Output.hpp>
+#include <Unreal/Core/CoreTypes.hpp>
 #include <Unreal/UnrealCoreStructs.hpp>
 #include <LuaMadeSimple/LuaMadeSimple.hpp>
 

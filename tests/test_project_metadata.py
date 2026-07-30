@@ -83,5 +83,28 @@ class ProjectMetadataTests(unittest.TestCase):
             )
 
 
+class PinnedUE4SSSourceCompatibilityTests(unittest.TestCase):
+    def test_core_types_and_map_are_available_before_unreal_core_structs(self):
+        source = (ROOT / "src/statics.h").read_text(encoding="utf-8")
+        includes = re.findall(r"^#include ([^\n]+)$", source, flags=re.MULTILINE)
+
+        unreal_core_structs = includes.index("<Unreal/UnrealCoreStructs.hpp>")
+        self.assertLess(includes.index("<map>"), unreal_core_structs)
+        self.assertLess(
+            includes.index("<Unreal/Core/CoreTypes.hpp>"),
+            unreal_core_structs,
+        )
+
+    def test_fstr_property_uses_fstring_view_conversion(self):
+        source = (ROOT / "src/statics.cpp").read_text(encoding="utf-8")
+        fstr_branch = source.split(
+            "if (property->IsA<FStrProperty>())", 1
+        )[1].split("else if (property->IsA<FNameProperty>())", 1)[0]
+
+        self.assertIn("const auto str = to_string(**propertyValue);", fstr_branch)
+        self.assertNotIn("GetCharArray", fstr_branch)
+        self.assertNotIn("to_string(str).c_str()", fstr_branch)
+
+
 if __name__ == "__main__":
     unittest.main()
