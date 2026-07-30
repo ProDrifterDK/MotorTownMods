@@ -106,10 +106,19 @@ class PinnedUE4SSSourceCompatibilityTests(unittest.TestCase):
         self.assertNotIn("to_string(str).c_str()", fstr_branch)
 
     def test_fstring_conversions_do_not_pass_tarray_storage_to_to_string(self):
-        for relative_path in ("src/statics.cpp", "src/dllmain.cpp"):
+        source_paths = sorted(
+            path
+            for path in (ROOT / "src").rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in {".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp"}
+        )
+        self.assertGreater(len(source_paths), 0)
+
+        for source_path in source_paths:
+            relative_path = source_path.relative_to(ROOT)
             with self.subTest(relative_path=relative_path):
-                source = (ROOT / relative_path).read_text(encoding="utf-8")
-                self.assertNotIn("GetCharArray()", source)
+                source = source_path.read_text(encoding="utf-8")
+                self.assertNotRegex(source, r"GetCharArray\s*\(")
 
 
 if __name__ == "__main__":
