@@ -1,312 +1,44 @@
-name: Build and Release on Branches
+name: Validate
 
 on:
   push:
     branches:
-      - release/v[0-9]+.[0-9]+.[0-9]+
-      - hotfix/v[0-9]+.[0-9]+.[0-9]+
+      - main
+      - "feature/**"
+      - "release/**"
+      - "hotfix/**"
+  pull_request:
+    branches:
+      - main
+      - "feature/**"
+      - "release/**"
+      - "hotfix/**"
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: write
-
-env:
-  RELEASE_MESSAGE_PATH: release_description.md
+  contents: read
 
 jobs:
-  build-core:
-    runs-on: windows-2022
-
-    steps:
-      - name: Checkout working repository
-        uses: actions/checkout@v4
-        with:
-          path: MotorTownMods
-
-      - name: Checkout UE4SS
-        uses: actions/checkout@v4
-        with:
-          repository: drpsyko101/RE-UE4SS
-          ref: amc
-          path: RE-UE4SS
-          submodules: recursive
-          token: ${{ secrets.UEPSEUDO_PAT }}
-
-      - name: Prep xmake
-        shell: pwsh
-        run: Write-Output "includes(`"RE-UE4SS`")`r`nincludes(`"MotorTownMods`")" | Out-File xmake.lua
-
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            .xmake
-            Binaries
-            Intermediates
-            C:/Users/runneradmin/AppData/Local/.xmake
-          key: ${{ runner.os }}-xmake-${{ hashFiles('**/xmake.lua') }}
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.9"
-
-      - name: Install VS2022 BuildTools 17.9.7
-        run: choco install -y visualstudio2022buildtools --version=117.9.7.0 --params "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --installChannelUri https://aka.ms/vs/17/release/180911598_-255012421/channel"
-
-      - name: Setup xmake
-        uses: xmake-io/github-action-setup-xmake@v1
-        with:
-          xmake-version: "2.9.3"
-
-      - name: Build
-        run: |
-          xmake f -m "Game__Shipping__Win64" -y
-          xmake project -k vsxmake2022 -m "Game__Shipping__Win64" -y
-          xmake build
-
-      - name: Package build
-        id: package-build
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force .\output\MotorTownMods\dlls
-          New-Item -ItemType File .\output\MotorTownMods\enabled.txt
-          Copy-Item .\Binaries\Game__Shipping__Win64\MotorTownMods\MotorTownMods.dll .\output\MotorTownMods\dlls\main.dll
-          Copy-Item -Recurse .\MotorTownMods\Scripts .\output\MotorTownMods\
-
-          $staticsFilePath = ".\output\MotorTownMods\Scripts\Statics.lua"
-          [regex]$versionRegex = '(release|hotfix)/v(.*)'
-          $modVersion = $versionRegex.Match("${{ github.ref_name }}").Groups[2].Value
-          (Get-Content $staticsFilePath) -replace '(ModVersion\s*=\s*").*(")', ('${1}' + "$modVersion" + '${2}') | Set-Content $staticsFilePath
-
-          Compress-Archive -Path .\output\MotorTownMods ".\MotorTownMods_v${modVersion}.zip"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: MotorTownMods_deps_release
-          path: |
-            MotorTownMods_v*.zip
-          overwrite: true
-
-  build-deps:
-    runs-on: windows-2022
-
-    steps:
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: shared.zip
-          key: lua-deps-${{ runner.os }}-v1
-
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: hashFiles('shared.zip') == ''
-        with:
-          arch: x64
-          sdk: "10.0.19041.0"
-
-      - name: Build static Lua
-        if: hashFiles('shared.zip') == ''
-        run: |
-          curl -L -o lua-5.4.8.tar.gz https://www.lua.org/ftp/lua-5.4.8.tar.gz
-          tar -xzf lua-5.4.8.tar.gz
-          cd lua-5.4.8/src
-          cl /c /O2 /W3 /DLUA_COMPAT_5_3 lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c lzio.c lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loslib.c lstrlib.c ltablib.c lutf8lib.c loadlib.c linit.c
-          lib /out:lua54.lib *.obj
-          cl /O2 lua.c lua54.lib /Fe:lua.exe
-          mkdir ..\..\lua\bin
-          mkdir ..\..\lua\include
-          mkdir ..\..\lua\lib
-          copy lua.exe ..\..\lua\bin\
-          copy lua.h ..\..\lua\include\
-          copy luaconf.h ..\..\lua\include\
-          copy lualib.h ..\..\lua\include\
-          copy lauxlib.h ..\..\lua\include\
-          copy lua54.lib ..\..\lua\lib\
-        shell: cmd
-
-      - name: Setup Lua PATH
-        if: hashFiles('shared.zip') == ''
-        run: |
-          "${{ github.workspace }}\lua\bin" | Out-File -FilePath "$env:GITHUB_PATH" -Append
-          "LUA=${{ github.workspace }}\lua\bin\lua.exe" | Out-File -FilePath "$env:GITHUB_ENV" -Append
-          "LUA_INCDIR=${{ github.workspace }}\lua\include" | Out-File -FilePath "$env:GITHUB_ENV" -Append
-          "LUA_LIBDIR=${{ github.workspace }}\lua\lib" | Out-File -FilePath "$env:GITHUB_ENV" -Append
-        shell: pwsh
-
-      - name: Verify Lua installation
-        if: hashFiles('shared.zip') == ''
-        run: |
-          lua -v
-          where lua
-        shell: cmd
-
-      - uses: luarocks/gh-actions-luarocks@v6
-        if: hashFiles('shared.zip') == ''
-        with:
-          withLuaPath: ${{ github.workspace }}\lua
-
-      - name: Install main modules
-        if: hashFiles('shared.zip') == ''
-        run: |
-          luarocks install --local luasocket CFLAGS="/MT"
-
-      - uses: ilammy/setup-nasm@v1
-        continue-on-error: true
-        if: hashFiles('shared.zip') == ''
-
-      - uses: shogo82148/actions-setup-perl@v1
-        continue-on-error: true
-        if: hashFiles('shared.zip') == ''
-        with:
-          perl-version: "5.40"
-          distribution: strawberry
-
-      - name: Checkout OpenSSL
-        uses: actions/checkout@v4
-        continue-on-error: true
-        if: hashFiles('shared.zip') == ''
-        with:
-          repository: openssl/openssl
-          path: OpenSSL
-          ref: openssl-3.0
-
-      - name: Build OpenSSL
-        continue-on-error: true
-        if: hashFiles('shared.zip') == ''
-        run: |
-          cd OpenSSL
-          perl Configure VC-WIN64A no-shared
-          nmake
-
-      - name: install additional modules
-        continue-on-error: true
-        if: hashFiles('shared.zip') == ''
-        run: |
-          luarocks install --local https://github.com/drpsyko101/luasec/raw/refs/heads/static/luasec-1.3.2-1.rockspec CFLAGS="/MT" OPENSSL_DIR=${{ github.workspace }}\OpenSSL
-          luarocks install --local bcrypt CFLAGS="/MT"
-          luarocks install --local lua-cjson CFLAGS="/MT"
-
-      - name: Package modules
-        if: hashFiles('shared.zip') == ''
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory shared
-          Copy-Item -Recurse -Force $env:APPDATA\luarocks\*\lua\5.4\* .\shared\
-          Compress-Archive -Path .\shared ".\shared.zip"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: MotorTownMods_deps_lua
-          path: shared.zip
-          overwrite: true
-
-  create-release:
-    needs:
-      - build-core
-      - build-deps
-    permissions:
-      contents: write
+  validate:
     runs-on: ubuntu-latest
-    outputs:
-      is-latest: ${{ steps.get-version.outputs.is-latest }}
-      version: ${{ steps.get-version.outputs.version }}
-      majorminor-version: ${{ steps.get-version.outputs.majorminor-version }}
-
     steps:
-      - name: Generate App Token
-        id: generate_token
-        uses: actions/create-github-app-token@v1
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          persist-credentials: false
 
-      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          token: ${{ steps.generate_token.outputs.token }}
+          python-version: "3.11"
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: MotorTownMods_deps_*
-          merge-multiple: true
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
 
-      - name: Get latest tag
-        id: latest-tag
-        uses: oprypin/find-latest-tag@v1
-        with:
-          repository: drpsyko101/MotorTownMods
-          prefix: v
-
-      - name: Get major.minor version
-        id: get-version
+      - name: Validate compatibility JSON metadata
+        shell: bash
         run: |
-          latest_tag="${{ steps.latest-tag.outputs.tag }}"
-          current_tag=$(echo "${{ github.ref_name }}" | sed -E 's/(release|hotfix)\/(v.*)/\2/g')
-          majorminor_tag=$(echo "${{ github.ref_name }}" | sed -E 's/(release|hotfix)\/(v[0-9]+)\.([0-9]+).*/\2.\3/g')
-          echo "version=$current_tag" >> $GITHUB_OUTPUT
-          echo "majorminor-version=$majorminor_tag" >> $GITHUB_OUTPUT
-
-          if [ ! -f "$RELEASE_MESSAGE_PATH" ]; then
-            jq -r .head_commit.message $GITHUB_EVENT_PATH | sed 1,2d > $RELEASE_MESSAGE_PATH
-          fi
-
-          echo "Latest tag: $latest_tag"
-          echo "Current tag: $current_tag"
-
-          function version { echo "$@" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'; }
-          if [ $(version "$current_tag") -ge $(version "$latest_tag") ]; then
-            echo "is-latest=true" >> $GITHUB_OUTPUT 
-          else
-            echo "is-latest=false" >> $GITHUB_OUTPUT 
-          fi
-
-      - name: Delete old release assets
-        uses: mknejp/delete-release-assets@v1
-        continue-on-error: true
-        with:
-          token: ${{ github.token }}
-          tag: ${{ steps.get-version.outputs.majorminor-version }}
-          assets: "*"
-
-      - name: Create/update release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: MotorTownMods ${{ steps.get-version.outputs.version }}
-          tag_name: ${{ steps.get-version.outputs.majorminor-version }}
-          body_path: ${{ env.RELEASE_MESSAGE_PATH }}
-          files: "**/*.zip"
-          make_latest: ${{ steps.get-version.outputs.is-latest }}
-          token: ${{ steps.generate_token.outputs.token }}
-
-  repo-cleanup:
-    needs:
-      - create-release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    continue-on-error: true
-
-    steps:
-      - name: Generate App Token
-        id: generate_token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ steps.generate_token.outputs.token }}
-
-      - name: Bump version
-        run: |
-          git config --global user.name "MotorTownRepoManager [bot]"
-          git config --global user.email "motortownrepomanager@users.noreply.github.com"
-          git tag -f ${{ needs.create-release.outputs.majorminor-version }}
-          git push -f origin ${{ needs.create-release.outputs.majorminor-version }}
-
-      - name: Delete current branch
-        run: |
-          git push -d origin ${{ github.ref_name }}
+          for manifest in compatibility/*.json; do
+            python -m json.tool "$manifest" > /dev/null
+            echo "validated $manifest"
+          done

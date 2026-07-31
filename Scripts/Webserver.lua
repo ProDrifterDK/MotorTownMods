@@ -14,7 +14,10 @@ local usePartialSend = os.getenv("MOD_SERVER_SEND_PARTIAL")
 local bcrypt = RequireSafe("bcrypt")
 
 local enableDebug = statics.ModLogLevel > 2
-local address = os.getenv("MOD_SERVER_HOST") or "*"
+local address = os.getenv("MOD_SERVER_HOST")
+    or os.getenv("MOD_SERVER_IP")
+    or os.getenv("MOD_SERVER_ADDRESS")
+    or "127.0.0.1"
 local port = tonumber(os.getenv("MOD_SERVER_PORT")) or 5001
 local isServerRunning = false
 local time = function()

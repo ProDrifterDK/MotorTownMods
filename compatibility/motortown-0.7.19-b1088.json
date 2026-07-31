@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "game": {
+    "name": "Motor Town: Behind The Wheel",
+    "version": "0.7.19",
+    "build": "B1088",
+    "steam_dedicated_server_app_id": 2223650,
+    "steam_dedicated_server_build_id": 24441403
+  },
+  "binary": {
+    "product": "Motor Town dedicated server",
+    "filename": "MotorTownServer-Win64-Shipping.exe",
+    "archived_evidence_filename": "MotorTownServer-B1088.exe",
+    "size": 156093440,
+    "sha256": "2B8F3E663EC4FCF1F72D4541260F8C3A2FEEFF72CC56FBB74259CC85F3CB4940"
+  },
+  "evidence": {
+    "status": "static_verified_runtime_pending",
+    "runtime_verified": false,
+    "deployment_approved": false
+  },
+  "toolchain": {
+    "ue4ss": {
+      "repository": "drpsyko101/RE-UE4SS",
+      "commit": "0a7434d97505c0f5c916e84ff8fc2f7bef794405"
+    },
+    "uepseudo": {
+      "repository": "Re-UE4SS/UEPseudo",
+      "commit": "121f2ff12e82e7bdbcfc6cb441a72941378a5dc8"
+    },
+    "patternsleuth": {
+      "repository": "trumank/patternsleuth",
+      "commit": "75b124983ec08fc2e32d53af1388d3cb3b5d31b8"
+    }
+  },
+  "signatures": [
+    {
+      "name": "FText_Constructor",
+      "pattern": "40 53 57 48 83 EC 38 48 89 6C 24 58 48 8B FA",
+      "expected_count": 2,
+      "expected_offsets": [
+        "0x12E5660",
+        "0x12F0D30"
+      ],
+      "runtime_disambiguation_required": true,
+      "runtime_disambiguation": "UE4SS custom override tests both structurally identical candidates under SEH and accepts only a successful FText round trip"
+    },
+    {
+      "name": "GUObjectArray",
+      "pattern": "48 8D 0D ?? ?? ?? ?? 48 8B D7 89 5C 24 20 44 8D 4B ??",
+      "expected_count": 1,
+      "expected_offsets": [
+        "0x15FED9A"
+      ],
+      "image_base": "0x140000000",
+      "resolved_virtual_address": "0x148D4A3B0"
+    }
+  ],
+  "limitations": [
+    "The generic PatternSleuth FTextFString resolver does not resolve B1031 or B1088.",
+    "Static identity and signature verification does not verify UE4SS initialization, runtime layouts, Lua APIs, hooks, saves, or restart behavior.",
+    "Deployment requires a successful disposable runtime canary."
+  ]
+}

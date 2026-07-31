@@ -22,8 +22,12 @@ using tcp = asio::ip::tcp;
 Webserver* _localServer = nullptr;
 
 Webserver::Webserver() {
-	const char* rawAddress = "0.0.0.0";
+	const char* rawAddress = "127.0.0.1";
 	if (const char* val = getenv("MOD_MANAGEMENT_ADDRESS"))
+	{
+		rawAddress = val;
+	}
+	else if (const char* val = getenv("MOD_SERVER_ADDRESS"))
 	{
 		rawAddress = val;
 	}

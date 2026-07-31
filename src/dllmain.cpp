@@ -63,7 +63,7 @@ auto MotorTownMods::on_lua_start(
 
 					FString uniqueIdString;
 					uniqueIdProp->ExportTextItem(uniqueIdString, uniqueId, nullptr, ptr, 0);
-					lua_net.set_string(to_string(uniqueIdString.GetCharArray()));
+					lua_net.set_string(to_string(*uniqueIdString));
 					return 1;
 				}
 			}
