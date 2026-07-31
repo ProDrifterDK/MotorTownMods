@@ -4,6 +4,7 @@
 #include <string>
 #include <DynamicOutput/Output.hpp>
 #include <Unreal/Core/CoreTypes.hpp>
+#include <Unreal/FProperty.hpp>
 #include <Unreal/UnrealCoreStructs.hpp>
 #include <LuaMadeSimple/LuaMadeSimple.hpp>
 
@@ -76,10 +77,10 @@ public:
 		{
 			try
 			{
-				// Use vformat with make_wformat_args for runtime formatting
+				// Use vformat with DynamicOutput's pinned format context
 				formatted_message = fmt::vformat(
 					fmt::detail::to_string_view(format),
-					fmt::make_format_args<fmt::buffer_context<wchar_t>>(args...));
+					RC_STD_MAKE_FORMAT_ARGS(args...));
 			}
 			catch (...)
 			{

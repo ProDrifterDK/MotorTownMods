@@ -84,7 +84,7 @@ class ProjectMetadataTests(unittest.TestCase):
 
 
 class PinnedUE4SSSourceCompatibilityTests(unittest.TestCase):
-    def test_core_types_and_map_are_available_before_unreal_core_structs(self):
+    def test_statics_header_binds_pinned_dependency_contracts(self):
         source = (ROOT / "src/statics.h").read_text(encoding="utf-8")
         includes = re.findall(r"^#include ([^\n]+)$", source, flags=re.MULTILINE)
 
@@ -94,6 +94,21 @@ class PinnedUE4SSSourceCompatibilityTests(unittest.TestCase):
             includes.index("<Unreal/Core/CoreTypes.hpp>"),
             unreal_core_structs,
         )
+
+        with self.subTest(contract="UEPseudo FProperty declaration"):
+            fproperty_header = "<Unreal/FProperty.hpp>"
+            self.assertIn(fproperty_header, includes)
+            self.assertLess(
+                source.index(f"#include {fproperty_header}"),
+                source.index("FProperty* property"),
+            )
+
+        with self.subTest(contract="DynamicOutput wide format arguments"):
+            self.assertIn("RC_STD_MAKE_FORMAT_ARGS(args...)", source)
+            self.assertNotRegex(
+                source,
+                r"fmt::make_format_args\s*<\s*fmt::buffer_context\s*<\s*wchar_t\s*>\s*>\s*\(",
+            )
 
     def test_fstr_property_uses_fstring_view_conversion(self):
         source = (ROOT / "src/statics.cpp").read_text(encoding="utf-8")
