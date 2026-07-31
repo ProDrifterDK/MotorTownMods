@@ -83,6 +83,39 @@ class ProjectMetadataTests(unittest.TestCase):
             )
 
 
+class ModsReloadCompatibilityTests(unittest.TestCase):
+    def test_production_source_does_not_call_non_exported_reinstall_mods(self):
+        source_paths = sorted(
+            path
+            for path in (ROOT / "src").rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in {".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp"}
+        )
+        self.assertGreater(len(source_paths), 0)
+
+        for source_path in source_paths:
+            with self.subTest(relative_path=source_path.relative_to(ROOT)):
+                source = source_path.read_text(encoding="utf-8")
+                self.assertNotRegex(source, r"\breinstall_mods\s*\(")
+
+    def test_exact_post_reload_route_fails_closed_as_not_implemented(self):
+        source = (ROOT / "src/modsmanager.cpp").read_text(encoding="utf-8")
+        response = source.split("ModsManager::GetResponseJson", 1)[1]
+
+        self.assertRegex(
+            response,
+            r"(?s)if \(req\.target\(\) == modsReloadPath\).*"
+            r"if \(req\.method\(\) == http::verb::post\).*"
+            r"statusCode = http::status::not_implemented;",
+        )
+        self.assertIn('obj["status"] = "not_implemented";', response)
+        self.assertIn(
+            'obj["message"] = "Mods reload is unavailable with the pinned UE4SS build.";',
+            response,
+        )
+        self.assertNotIn("http::status::accepted", response)
+
+
 class PinnedUE4SSSourceCompatibilityTests(unittest.TestCase):
     def test_statics_header_binds_pinned_dependency_contracts(self):
         source = (ROOT / "src/statics.h").read_text(encoding="utf-8")

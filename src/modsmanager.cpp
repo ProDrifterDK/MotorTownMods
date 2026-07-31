@@ -1,7 +1,5 @@
 #include "modsmanager.h"
 
-#include <UE4SSProgram.hpp>
-
 static const char* modsReloadPath = "/mods/reload";
 
 bool ModsManager::IsMatchingRequest(http::request<http::string_body> req)
@@ -20,9 +18,9 @@ json::object ModsManager::GetResponseJson(http::request<http::string_body> req, 
 	{
 		if (req.method() == http::verb::post)
 		{
-			UE4SSProgram::get_program().reinstall_mods();
-			statusCode = http::status::accepted;
-			obj["status"] = "received mods reload signal";
+			statusCode = http::status::not_implemented;
+			obj["status"] = "not_implemented";
+			obj["message"] = "Mods reload is unavailable with the pinned UE4SS build.";
 			return obj;
 		}
 	}
