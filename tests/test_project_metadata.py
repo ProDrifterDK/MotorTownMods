@@ -98,7 +98,7 @@ class ModsReloadCompatibilityTests(unittest.TestCase):
                 source = source_path.read_text(encoding="utf-8")
                 self.assertNotRegex(source, r"\breinstall_mods\s*\(")
 
-    def test_exact_post_reload_route_fails_closed_as_not_implemented(self):
+    def test_exact_post_reload_route_and_readme_fail_closed_as_not_implemented(self):
         source = (ROOT / "src/modsmanager.cpp").read_text(encoding="utf-8")
         response = source.split("ModsManager::GetResponseJson", 1)[1]
 
@@ -109,11 +109,26 @@ class ModsReloadCompatibilityTests(unittest.TestCase):
             r"statusCode = http::status::not_implemented;",
         )
         self.assertIn('obj["status"] = "not_implemented";', response)
-        self.assertIn(
-            'obj["message"] = "Mods reload is unavailable with the pinned UE4SS build.";',
-            response,
-        )
+        message = "Mods reload is unavailable with the pinned UE4SS build."
+        self.assertIn(f'obj["message"] = "{message}";', response)
         self.assertNotIn("http::status::accepted", response)
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        reload_guidance = readme.split("### Reloading mod", 1)[1].split(
+            "## Documentation", 1
+        )[0]
+        self.assertIn("HTTP `501 Not Implemented`", reload_guidance)
+        self.assertIn("status `not_implemented`", reload_guidance)
+        self.assertIn(f"message `{message}`", reload_guidance)
+        self.assertIn(
+            "Do not stop the Lua server expecting this endpoint to reload mods.",
+            reload_guidance,
+        )
+        self.assertIn(
+            "Restart the dedicated server/UE4SS process to reload mods.",
+            reload_guidance,
+        )
+        self.assertNotIn("This will reload all the Lua mods", reload_guidance)
 
 
 class PinnedUE4SSSourceCompatibilityTests(unittest.TestCase):

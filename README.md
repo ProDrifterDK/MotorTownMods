@@ -134,12 +134,9 @@ Address precedence is server-specific and backward-compatible:
 
 The legacy Lua host/IP settings never configure the management server, and the legacy management setting never configures the Lua server. A Lua-only `MOD_SERVER_HOST=*` therefore remains valid and does not expose the management server. Shared management values must be numeric IP addresses; literal `*` is not accepted by the C++ server. Use a non-loopback address, including `0.0.0.0` or `::` for all interfaces, only for intentional secured exposure with appropriate authentication and firewalling.
 
-### Reloading mod
+### Reloading mods
 
-Due to the webserver being ran on a separate thread, a stop command must be issued before reloading the mods.
-
-1. Send **POST** `/stop` to the `MOD_SERVER_PORT` server. A message `Webserver stopped` will show up in the `UE4SS.log` indicating the webserver has stopped.
-2. Send **POST** `/mods/reload` to the `MOD_MANAGEMENT_PORT` server. This will reload all the Lua mods including this mod.
+With the pinned UE4SS build, **POST** `/mods/reload` on the `MOD_MANAGEMENT_PORT` server returns HTTP `501 Not Implemented` with status `not_implemented` and message `Mods reload is unavailable with the pinned UE4SS build.` Do not stop the Lua server expecting this endpoint to reload mods. Restart the dedicated server/UE4SS process to reload mods.
 
 ## Documentation
 
