@@ -176,7 +176,7 @@ local function HandleTeleportPlayer(session)
               PC:ServerTeleportCharacter(location, false, false)
             elseif pawn:IsA(vehicleClass) then
               ---@cast pawn AMTVehicle
-              PC:ServerResetVehicleAt(pawn, location, rotation, true)
+              PC:ServerResetVehicleAt(pawn, location, rotation, false, false)
             else
               error("Failed to teleport player")
             end

@@ -82,6 +82,39 @@ class ProjectMetadataTests(unittest.TestCase):
                 signature["name"],
             )
 
+    def test_b1088_teleport_contract(self):
+        source = (ROOT / "Scripts/PlayerManager.lua").read_text(encoding="utf-8")
+        handler = source.split("local function HandleTeleportPlayer(session)", 1)[
+            1
+        ].split("---Handle removing given amount from gameplay effect stack", 1)[0]
+        active_handler = re.sub(
+            r"--\[(=*)\[.*?\]\1\]", "", handler, flags=re.DOTALL
+        )
+        active_handler = "\n".join(
+            line.split("--", 1)[0] for line in active_handler.splitlines()
+        )
+        reset_call_sites = re.findall(
+            r"\bPC:ServerResetVehicleAt\s*\(", active_handler
+        )
+        reset_arguments = [
+            re.sub(r"\s+", " ", arguments).strip()
+            for arguments in re.findall(
+                r"\bPC:ServerResetVehicleAt\s*\(([^()]*)\)", active_handler
+            )
+        ]
+        self.assertEqual(len(reset_arguments), len(reset_call_sites))
+        self.assertEqual(
+            reset_arguments, ["pawn, location, rotation, false, false"]
+        )
+
+        yaw_values = [
+            re.sub(r"\s+", " ", value).strip()
+            for value in re.findall(r"\bYaw\s*=\s*([^,;}\n]+)", active_handler)
+        ]
+        self.assertEqual(
+            yaw_values, ["data.Rotation and data.Rotation.Yaw or 0.0"]
+        )
+
 
 class ModsReloadCompatibilityTests(unittest.TestCase):
     def test_production_source_does_not_call_non_exported_reinstall_mods(self):
