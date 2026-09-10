@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <LuaMadeSimple/LuaMadeSimple.hpp>
+#include <Unreal/FWeakObjectPtr.hpp>
 
 namespace RC::Unreal
 {
@@ -79,6 +80,9 @@ namespace MotorTown::Snapshot
         static auto take(uint64_t request_id) -> std::optional<Result>;
         static auto cancel(uint64_t request_id) -> bool;
         static auto cancel_all() -> void;
+        static auto set_active_game_state(RC::Unreal::UObject* game_state, RC::Unreal::UObject* world) -> void;
+        static auto clear_active_game_state() -> void;
+        static auto resolve_active_game_state() -> RC::Unreal::UObject*;
         static auto push_value(const RC::LuaMadeSimple::Lua& lua, const Value& value) -> void;
 
       private:
@@ -92,5 +96,7 @@ namespace MotorTown::Snapshot
         static std::mutex s_mutex;
         static std::map<uint64_t, Entry> s_entries;
         static uint64_t s_next_id;
+        static RC::Unreal::FWeakObjectPtr s_active_game_state;
+        static RC::Unreal::FWeakObjectPtr s_active_world;
     };
 }

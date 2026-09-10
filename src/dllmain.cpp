@@ -4,14 +4,21 @@
 #include <Mod/LuaMod.hpp>
 #include <LuaType/LuaUObject.hpp>
 #include <LuaType/LuaUScriptStruct.hpp>
+#include <Unreal/AGameModeBase.hpp>
+#include <Unreal/FURL.hpp>
+#include <Unreal/FWorldContext.hpp>
+#include <Unreal/Hooks.hpp>
+#include <Unreal/UEngine.hpp>
 #include <Unreal/UFunction.hpp>
 #include <Unreal/UScriptStruct.hpp>
+#include <Unreal/Property/FObjectProperty.hpp>
 #include <Unreal/Property/FStrProperty.hpp>
 
 #include "webserver.h"
 #include "statics.h"
 #include "snapshot.h"
 
+#include <algorithm>
 #include <sstream>
 
 using namespace RC;
@@ -43,32 +50,56 @@ namespace
     auto request_game_state_snapshot(const LuaMadeSimple::Lua& lua) -> int
     {
         lua_State* state = lua.get_lua_state();
-        if (!lua.is_string(1)) lua.throw_error("RequestGameStateSnapshot requires a query kind");
+        const auto has_argument = [&](int index) {
+            const int type = lua_type(state, index);
+            return type != LUA_TNONE && type != LUA_TNIL;
+        };
+        if (lua_type(state, 1) != LUA_TSTRING) lua.throw_error("RequestGameStateSnapshot requires a query kind");
         MotorTown::Snapshot::Query query;
         const std::string kind{lua_tostring(state, 1)};
         if (kind == "vehicles") query.kind = MotorTown::Snapshot::Query::Kind::Vehicles;
         else if (kind == "players") query.kind = MotorTown::Snapshot::Query::Kind::Players;
         else lua.throw_error("unsupported snapshot query kind");
 
-        if (lua.is_string(2))
+        if (has_argument(2) && lua_type(state, 2) != LUA_TSTRING) lua.throw_error("snapshot ID must be a string");
+        if (lua_type(state, 2) == LUA_TSTRING)
         {
             const std::string id{lua_tostring(state, 2)};
             if (query.kind == MotorTown::Snapshot::Query::Kind::Vehicles && !id.empty())
             {
-                try { query.vehicle_id = std::stoll(id); }
-                catch (...) { lua.throw_error("invalid vehicle snapshot ID"); }
+                const size_t digits_begin = id.front() == '-' ? 1 : 0;
+                if (digits_begin == id.size() || !std::all_of(id.begin() + digits_begin, id.end(), [](unsigned char value) { return value >= '0' && value <= '9'; }))
+                    lua.throw_error("invalid vehicle snapshot ID");
+                try
+                {
+                    size_t consumed{};
+                    const auto parsed = std::stoll(id, &consumed);
+                    if (consumed != id.size()) lua.throw_error("invalid vehicle snapshot ID");
+                    query.vehicle_id = parsed;
+                }
+                catch (const std::exception&) { lua.throw_error("invalid vehicle snapshot ID"); }
             }
             else query.player_id = id;
         }
-        if (lua.is_string(3)) query.fields = split_fields(lua_tostring(state, 3));
-        if (lua.is_integer(4)) query.limit = static_cast<size_t>(lua_tointeger(state, 4));
+        if (has_argument(3) && lua_type(state, 3) != LUA_TSTRING) lua.throw_error("snapshot fields must be a string");
+        if (lua_type(state, 3) == LUA_TSTRING) query.fields = split_fields(lua_tostring(state, 3));
+        if (has_argument(4) && !lua.is_integer(4)) lua.throw_error("snapshot limit must be an integer");
+        if (lua.is_integer(4))
+        {
+            const auto limit = lua_tointeger(state, 4);
+            if (limit < 1 || limit > 500) lua.throw_error("snapshot limit must be between 1 and 500");
+            query.limit = static_cast<size_t>(limit);
+        }
+        if (has_argument(5) && !lua.is_bool(5)) lua.throw_error("snapshot controlled-only flag must be boolean");
         if (lua.is_bool(5)) query.controlled_only = lua_toboolean(state, 5) != 0;
+        if (has_argument(6) && !lua.is_integer(6)) lua.throw_error("snapshot depth must be an integer");
         if (lua.is_integer(6))
         {
             const auto depth = lua_tointeger(state, 6);
             if (depth < 0 || depth > 8) lua.throw_error("snapshot depth must be between 0 and 8");
             query.limits.max_depth = static_cast<int32>(std::max<lua_Integer>(2, depth));
         }
+        if (has_argument(7) && !lua.is_integer(7)) lua.throw_error("snapshot timeout must be an integer");
         const int64_t timeout_ms = lua.is_integer(7) ? lua_tointeger(state, 7) : 2000;
         if (timeout_ms < 50 || timeout_ms > 5000) lua.throw_error("snapshot timeout must be between 50 and 5000 ms");
         query.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -150,6 +181,23 @@ MotorTownMods::MotorTownMods()
 
 auto MotorTownMods::on_unreal_init() -> void
 {
+	Unreal::Hook::RegisterLoadMapPreCallback(
+		[](Unreal::UEngine*, Unreal::FWorldContext&, Unreal::FURL, Unreal::UPendingNetGame*, Unreal::FString&) -> std::pair<bool, bool> {
+			MotorTown::Snapshot::Store::clear_active_game_state();
+			return {false, false};
+		});
+	Unreal::Hook::RegisterInitGameStatePostCallback([](Unreal::AGameModeBase* context) {
+		MotorTown::Snapshot::Store::clear_active_game_state();
+		if (!context) return;
+		auto* game_state_property = context->GetPropertyByNameInChain(STR("GameState"));
+		if (!game_state_property || !game_state_property->IsA<Unreal::FObjectProperty>()) return;
+		auto* storage = game_state_property->ContainerPtrToValuePtr<void>(context);
+		auto* game_state = static_cast<Unreal::FObjectProperty*>(game_state_property)->GetObjectPropertyValue(storage);
+		auto* world = context->GetWorld();
+		if (!game_state || !world || game_state->GetWorld() != world) return;
+		MotorTown::Snapshot::Store::set_active_game_state(game_state, world);
+	});
+
 	// Init API server
 	auto server = Webserver::Get();
 }

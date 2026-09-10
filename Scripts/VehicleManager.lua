@@ -291,21 +291,23 @@ webhook.RegisterEventHook(
 ---Handle the get vehicles commands
 ---@type RequestPathHandler
 local function HandleGetVehicles(session)
-  local id = tonumber(session.pathComponents[2]) or nil
+  local id = session.pathComponents[2]
+  if id and not id:match("^%-?%d+$") then
+    return json.stringify { error = "vehicle ID must be a complete decimal integer" }, nil, 400
+  end
   local fields = SplitString(session.queryComponents.filters, ",")
-  local limit = tonumber(session.queryComponents.limit)
-  local isPlayerControlled = session.queryComponents.isPlayerControlled == "true" or false
-  local depth = tonumber(session.queryComponents.depth)
-
-  if limit and (limit < 1 or limit > 500) then
-    return json.stringify { error = "limit must be between 1 and 500" }, nil, 400
+  local limit, limitError = ParseIntegerQuery(session.queryComponents.limit, "limit", 1, 500)
+  if limitError then return json.stringify { error = limitError }, nil, 400 end
+  local depth, depthError = ParseIntegerQuery(session.queryComponents.depth, "depth", 0, 8)
+  if depthError then return json.stringify { error = depthError }, nil, 400 end
+  local controlled = session.queryComponents.isPlayerControlled
+  if controlled and controlled ~= "true" and controlled ~= "false" then
+    return json.stringify { error = "isPlayerControlled must be true or false" }, nil, 400
   end
-  if depth and (depth < 0 or depth > 8) then
-    return json.stringify { error = "depth must be between 0 and 8" }, nil, 400
-  end
+  local isPlayerControlled = controlled == "true"
 
   local token, deadline = RequestAsyncSnapshot(
-    "vehicles", id and tostring(id) or nil, fields, limit, isPlayerControlled, depth, 2000)
+    "vehicles", id, fields, limit, isPlayerControlled, depth, 2000)
   return {
     snapshotToken = token,
     deadline = deadline,

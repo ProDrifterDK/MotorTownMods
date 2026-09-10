@@ -132,10 +132,8 @@ end)
 local function HandleGetPlayerStates(session)
   local playerId = session.pathComponents[2]
   local filters = SplitString(session.queryComponents.filters, ",")
-  local depth = tonumber(session.queryComponents.depth)
-  if depth and (depth < 0 or depth > 8) then
-    return json.stringify { error = "depth must be between 0 and 8" }, nil, 400
-  end
+  local depth, depthError = ParseIntegerQuery(session.queryComponents.depth, "depth", 0, 8)
+  if depthError then return json.stringify { error = depthError }, nil, 400 end
 
   local token, deadline = RequestAsyncSnapshot("players", playerId, filters, 100, false, depth, 2000)
   return {

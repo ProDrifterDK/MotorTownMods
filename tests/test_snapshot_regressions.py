@@ -63,7 +63,8 @@ class SnapshotRegressionTests(unittest.TestCase):
     def test_snapshot_results_are_owned_values_and_bounded(self):
         header = (ROOT / "src/snapshot.h").read_text()
         self.assertIn("std::variant<std::monostate, bool, int64_t, double, std::string, Array, Object>", header)
-        self.assertNotIn("UObject*", header)
+        value_contract = header.split("struct Value", 1)[1].split("enum class State", 1)[0]
+        self.assertNotIn("UObject*", value_contract)
         self.assertIn("MaxPending = 64", header)
         source = (ROOT / "src/snapshot.cpp").read_text()
         self.assertIn("max_nodes", source)
@@ -101,6 +102,65 @@ class SnapshotRegressionTests(unittest.TestCase):
         guard = source.split("auto require_game_thread", 1)[1].split("auto split_fields", 1)[0]
         self.assertIn("LuaMod::is_in_game_thread()", guard)
         self.assertNotIn("is_executing_engine_tick_action", guard)
+
+    def test_active_root_rejects_stale_world_after_travel(self):
+        compiler = shutil.which("c++") or shutil.which("g++")
+        if not compiler:
+            self.skipTest("C++ compiler unavailable")
+        source = textwrap.dedent(r"""
+            #include "src/active_snapshot_root.h"
+            #include <cassert>
+            struct World {};
+            struct Root { World* world; World* GetWorld() { return world; } };
+            template <typename T> struct Weak {
+                T* value{};
+                T* Get() const { return value; }
+            };
+            int main() {
+                World old_world, new_world;
+                Root old_root{&old_world};
+                assert(ResolveActiveSnapshotRoot(Weak<Root>{&old_root}, Weak<World>{&old_world}) == &old_root);
+                assert(ResolveActiveSnapshotRoot(Weak<Root>{&old_root}, Weak<World>{&new_world}) == nullptr);
+                assert(ResolveActiveSnapshotRoot(Weak<Root>{}, Weak<World>{&new_world}) == nullptr);
+            }
+        """)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "root.cpp"
+            binary_path = Path(directory) / "root"
+            source_path.write_text(source)
+            subprocess.run([compiler, "-std=c++20", "-I", str(ROOT), str(source_path), "-o", str(binary_path)], check=True)
+            subprocess.run([str(binary_path)], check=True)
+
+    def test_root_discovery_is_cached_and_deadline_checked(self):
+        source = (ROOT / "src/snapshot.cpp").read_text()
+        capture = source.split("auto capture_query", 1)[1].split("auto Store::begin", 1)[0]
+        self.assertNotIn("FindFirstOf", capture)
+        self.assertIn("Store::resolve_active_game_state()", capture)
+        self.assertLess(capture.index("Budget budget"), capture.index("Store::resolve_active_game_state()"))
+        root_helper = (ROOT / "src/active_snapshot_root.h").read_text()
+        self.assertIn("ResolveActiveSnapshotRoot", root_helper)
+        dll = (ROOT / "src/dllmain.cpp").read_text()
+        self.assertIn("RegisterLoadMapPreCallback", dll)
+        self.assertIn("RegisterInitGameStatePostCallback", dll)
+
+    def test_query_validation_rejects_fractional_and_partial_values(self):
+        helpers = (ROOT / "Scripts/Helpers.lua").read_text()
+        vehicles = (ROOT / "Scripts/VehicleManager.lua").read_text()
+        players = (ROOT / "Scripts/PlayerManager.lua").read_text()
+        binding = (ROOT / "src/dllmain.cpp").read_text()
+        self.assertIn("function ParseIntegerQuery", helpers)
+        self.assertIn("parsed % 1 ~= 0", helpers)
+        self.assertIn('vehicle ID must be a complete decimal integer', vehicles)
+        self.assertIn("consumed != id.size()", binding)
+        self.assertIn("lua_type(state, 2) != LUA_TSTRING", binding)
+        self.assertIn('ParseIntegerQuery(session.queryComponents.limit', vehicles)
+        self.assertIn('ParseIntegerQuery(session.queryComponents.depth', players)
+
+    def test_webhook_loop_stops_cleanly_without_luasocket(self):
+        source = (ROOT / "Scripts/Webclient.lua").read_text()
+        callback = source.split("LoopAsync(delay, function()", 1)[1]
+        self.assertIn("if not socket then return true end", callback)
+        self.assertLess(callback.index("if not socket then return true end"), callback.index("socket.gettime()"))
 
     def test_b1104_contract_is_distinct_and_runtime_pending(self):
         b1088 = json.loads((ROOT / "compatibility/motortown-0.7.19-b1088.json").read_text())

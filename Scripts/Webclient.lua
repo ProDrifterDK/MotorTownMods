@@ -182,6 +182,7 @@ end
 -- This will slot in between webserver loops.
 local delay = (tonumber(os.getenv("MOD_SERVER_PROCESS_AMOUNT")) or 5) * 100
 LoopAsync(delay, function()
+    if not socket then return true end
     discardExpired(math.floor(socket.gettime() * 1000))
     if #requests > 0 then
         local payloads = {} ---@type table[]

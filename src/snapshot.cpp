@@ -1,4 +1,5 @@
 #include "snapshot.h"
+#include "active_snapshot_root.h"
 
 #include <algorithm>
 #include <limits>
@@ -6,7 +7,6 @@
 #include <unordered_set>
 
 #include <Unreal/UObject.hpp>
-#include <Unreal/UObjectGlobals.hpp>
 #include <Unreal/UnrealFlags.hpp>
 #include <Unreal/UScriptStruct.hpp>
 #include <Unreal/Property/FArrayProperty.hpp>
@@ -29,6 +29,8 @@ namespace MotorTown::Snapshot
     std::mutex Store::s_mutex{};
     std::map<uint64_t, Store::Entry> Store::s_entries{};
     uint64_t Store::s_next_id{1};
+    FWeakObjectPtr Store::s_active_game_state{};
+    FWeakObjectPtr Store::s_active_world{};
 
     namespace
     {
@@ -401,8 +403,11 @@ namespace MotorTown::Snapshot
                 throw std::runtime_error{"snapshot deadline expired before capture"};
             }
 
-            auto game_state = UObjectGlobals::FindFirstOf(STR("MotorTownGameState"));
-            if (!object_is_readable(game_state) || !game_state->GetWorld())
+            Budget budget{query.limits, query.deadline};
+            budget.node();
+            auto* game_state = Store::resolve_active_game_state();
+            budget.node();
+            if (!object_is_readable(game_state))
                 throw std::runtime_error{"active MotorTownGameState is unavailable"};
 
             const wchar_t* array_name = query.kind == Query::Kind::Vehicles ? STR("Vehicles") : STR("PlayerArray");
@@ -419,7 +424,6 @@ namespace MotorTown::Snapshot
                 throw std::runtime_error{"game-state snapshot array has an unsupported element type"};
             }
             auto array = array_property->ContainerPtrToValuePtr<FScriptArray>(game_state);
-            Budget budget{query.limits, query.deadline};
             budget.container(static_cast<size_t>(std::max(0, array->Num())));
             Value::Array result;
             result.reserve(std::min(static_cast<size_t>(array->Num()), query.limit));
@@ -550,6 +554,26 @@ namespace MotorTown::Snapshot
     {
         std::lock_guard guard{s_mutex};
         s_entries.clear();
+    }
+
+    auto Store::set_active_game_state(UObject* game_state, UObject* world) -> void
+    {
+        std::lock_guard guard{s_mutex};
+        s_active_game_state = game_state;
+        s_active_world = world;
+    }
+
+    auto Store::clear_active_game_state() -> void
+    {
+        std::lock_guard guard{s_mutex};
+        s_active_game_state = nullptr;
+        s_active_world = nullptr;
+    }
+
+    auto Store::resolve_active_game_state() -> UObject*
+    {
+        std::lock_guard guard{s_mutex};
+        return ResolveActiveSnapshotRoot(s_active_game_state, s_active_world);
     }
 
     auto Store::push_value(const LuaMadeSimple::Lua& lua, const Value& value) -> void

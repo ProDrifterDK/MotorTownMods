@@ -456,6 +456,22 @@ function ExecuteInGameThreadSync(exec, timeoutMs)
   if callbackError then error(callbackError) end
 end
 
+---Parse an optional bounded decimal integer from an HTTP query.
+---@param raw string?
+---@param name string
+---@param minimum integer
+---@param maximum integer
+---@return integer?
+---@return string?
+function ParseIntegerQuery(raw, name, minimum, maximum)
+  if raw == nil then return nil, nil end
+  local parsed = tonumber(raw)
+  if not parsed or parsed ~= parsed or parsed % 1 ~= 0 or parsed < minimum or parsed > maximum then
+    return nil, string.format("%s must be an integer between %d and %d", name, minimum, maximum)
+  end
+  return parsed, nil
+end
+
 ---Begin a bounded native snapshot and enqueue only its numeric token for capture.
 ---The closure owns no socket, session, request body, UObject, or Lua userdata.
 ---@param kind "vehicles"|"players"
@@ -468,9 +484,18 @@ end
 ---@return integer token
 ---@return integer deadlineMs
 function RequestAsyncSnapshot(kind, id, fields, limit, controlledOnly, depth, timeoutMs)
-  timeoutMs = math.max(50, math.min(timeoutMs or 2000, 5000))
-  limit = math.max(1, math.min(limit or 100, 500))
-  depth = math.max(0, math.min(depth or 2, 8))
+  timeoutMs = timeoutMs or 2000
+  limit = limit or 100
+  depth = depth or 2
+  if type(timeoutMs) ~= "number" or timeoutMs % 1 ~= 0 or timeoutMs < 50 or timeoutMs > 5000 then
+    error("timeoutMs must be an integer between 50 and 5000")
+  end
+  if type(limit) ~= "number" or limit % 1 ~= 0 or limit < 1 or limit > 500 then
+    error("limit must be an integer between 1 and 500")
+  end
+  if type(depth) ~= "number" or depth % 1 ~= 0 or depth < 0 or depth > 8 then
+    error("depth must be an integer between 0 and 8")
+  end
   local token = RequestGameStateSnapshot(
     kind,
     id or "",
