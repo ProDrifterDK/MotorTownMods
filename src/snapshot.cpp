@@ -7,6 +7,7 @@
 #include <unordered_set>
 
 #include <Unreal/UObject.hpp>
+#include <Unreal/UClass.hpp>
 #include <Unreal/UnrealFlags.hpp>
 #include <Unreal/UScriptStruct.hpp>
 #include <Unreal/Property/FArrayProperty.hpp>
@@ -97,7 +98,7 @@ namespace MotorTown::Snapshot
         auto object_is_readable(UObject* object) -> bool
         {
             return object && !object->IsUnreachable() &&
-                   !object->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed);
+                   !object->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed));
         }
 
         auto object_reference(UObject* object, Budget& budget) -> Value
