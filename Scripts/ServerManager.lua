@@ -202,12 +202,9 @@ end
 ---Handle get server status
 ---@type RequestPathHandler
 local function HandleGetServerStatus(session)
-    local gameState = GetMotorTownGameState()
-    if not gameState:IsValid() then
-        -- Game state is not created yet
-        return json.stringify { status = "not ready" }, nil, 503
-    end
-    return json.stringify { status = "ok" }
+    -- A response from this loop is the health signal. Do not touch live engine
+    -- state from the HTTP worker merely to answer readiness.
+    return json.stringify { status = "ok", snapshotSchemaVersion = 2 }
 end
 
 ---Handle request to change server settings

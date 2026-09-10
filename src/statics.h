@@ -118,5 +118,6 @@ public:
 		void* data,
 		Lua::Table& table,
 		const PropertyType propertyType = PropertyType::None,
-		const int32 depth = 0);
+		const int32 depth = 0,
+		const bool valueAddress = false);
 };

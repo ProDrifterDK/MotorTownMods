@@ -28,7 +28,7 @@ local function LoadWebserver()
     local server = require("Webserver")
 
     -- General server status
-    server.registerHandler("/status", "GET", serverManager.HandleGetServerStatus, false)
+    server.registerHandler("/status", "GET", serverManager.HandleGetServerStatus, false, true)
     server.registerHandler("/status/general", "GET", serverManager.HandleGetServerState)
     server.registerHandler("/status/general/*", "GET", serverManager.HandleGetZoneState)
     server.registerHandler("/settings/traffic", "GET", serverManager.HandleGetNpcTraffic)
@@ -37,11 +37,11 @@ local function LoadWebserver()
     server.registerHandler("/command", "POST", serverManager.HandleServerExecCommand)
 
     -- Player management
-    server.registerHandler("/players", "GET", playerManager.HandleGetPlayerStates)
+    server.registerHandler("/players", "GET", playerManager.HandleGetPlayerStates, nil, true)
     server.registerHandler("/players/*/teleport", "POST", playerManager.HandleTeleportPlayer)
     server.registerHandler("/players/*/money", "POST", playerManager.HandleAddMoney)
     server.registerHandler("/players/*/gameplay/effects", "DELETE", playerManager.HandleRemoveGameplayEffect)
-    server.registerHandler("/players/*", "GET", playerManager.HandleGetPlayerStates)
+    server.registerHandler("/players/*", "GET", playerManager.HandleGetPlayerStates, nil, true)
     server.registerHandler("/players/*/eject", "POST", vehicleManager.HandleEjectPlayer)
 
     -- Event management
@@ -66,10 +66,10 @@ local function LoadWebserver()
     server.registerHandler("/delivery/*", "GET", cargoManager.HandleGetDeliveries)
 
     -- Vehicle management
-    server.registerHandler("/vehicles", "GET", vehicleManager.HandleGetVehicles)
+    server.registerHandler("/vehicles", "GET", vehicleManager.HandleGetVehicles, nil, true)
     server.registerHandler("/vehicles", "PATCH", vehicleManager.HandleSetVehicleParameter)
     server.registerHandler("/vehicles/*/despawn", "POST", vehicleManager.HandleDespawnVehicle)
-    server.registerHandler("/vehicles/*", "GET", vehicleManager.HandleGetVehicles)
+    server.registerHandler("/vehicles/*", "GET", vehicleManager.HandleGetVehicles, nil, true)
     server.registerHandler("/vehicles/*", "PATCH", vehicleManager.HandleSetVehicleParameter)
     server.registerHandler("/vehicles/*/fuel", "POST", vehicleManager.HandleSetVehicleFuel)
     server.registerHandler("/vehicles/*/parts/*/damage", "POST", vehicleManager.HandleSetVehiclePartDamage)

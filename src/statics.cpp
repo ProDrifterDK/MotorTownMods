@@ -1,4 +1,6 @@
 #include "statics.h"
+#include "container_iteration.h"
+#include <limits>
 #include <Unreal/UObjectGlobals.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UScriptStruct.hpp>
@@ -34,9 +36,12 @@ void ModStatics::ExportPropertyAsTable(
 	void* data,
 	Lua::Table& table,
 	const PropertyType propertyType,
-	const int32 depth)
+	const int32 depth,
+	const bool valueAddress)
 {
-	if (!property) return;
+	if (!property || !data) return;
+	void* propertyStorage = valueAddress ? data : property->ContainerPtrToValuePtr<void>(data);
+	if (!propertyStorage) return;
 
 	// Limit recursive depth search
 	std::vector<int> empty;
@@ -51,7 +56,7 @@ void ModStatics::ExportPropertyAsTable(
 
 	if (property->IsA<FStrProperty>())
 	{
-		auto propertyValue = property->ContainerPtrToValuePtr<FString>(data);
+		auto propertyValue = static_cast<FString*>(propertyStorage);
 		const auto str = to_string(**propertyValue);
 		switch (propertyType)
 		{
@@ -67,7 +72,7 @@ void ModStatics::ExportPropertyAsTable(
 	}
 	else if (property->IsA<FNameProperty>())
 	{
-		auto propertyValue = property->ContainerPtrToValuePtr<FName>(data);
+		auto propertyValue = static_cast<FName*>(propertyStorage);
 		const auto str = propertyValue->ToString();
 		switch (propertyType)
 		{
@@ -83,7 +88,7 @@ void ModStatics::ExportPropertyAsTable(
 	}
 	else if (property->IsA<FTextProperty>())
 	{
-		auto propertyValue = property->ContainerPtrToValuePtr<FText>(data);
+		auto propertyValue = static_cast<FText*>(propertyStorage);
 		const auto str = propertyValue->ToString();
 		switch (propertyType)
 		{
@@ -99,7 +104,7 @@ void ModStatics::ExportPropertyAsTable(
 	}
 	else if (property->IsA<FFloatProperty>())
 	{
-		const auto propertyValue = *property->ContainerPtrToValuePtr<float>(data);
+		const auto propertyValue = *static_cast<float*>(propertyStorage);
 		switch (propertyType)
 		{
 		case PropertyType::Array:
@@ -114,7 +119,7 @@ void ModStatics::ExportPropertyAsTable(
 	}
 	else if (property->IsA<FDoubleProperty>())
 	{
-		const auto propertyValue = *property->ContainerPtrToValuePtr<double>(data);
+		const auto propertyValue = *static_cast<double*>(propertyStorage);
 		switch (propertyType)
 		{
 		case PropertyType::Array:
@@ -127,9 +132,17 @@ void ModStatics::ExportPropertyAsTable(
 			table.add_pair(propName.c_str(), propertyValue);
 		}
 	}
-	else if (property->IsA<FIntProperty>() || property->IsA<FInt64Property>() || property->IsA<FUInt32Property>() || property->IsA<FInt8Property>() || property->IsA<FInt16Property>())
+	else if (property->IsA<FIntProperty>() || property->IsA<FInt64Property>() || property->IsA<FUInt32Property>() || property->IsA<FUInt64Property>() || property->IsA<FInt8Property>() || property->IsA<FInt16Property>())
 	{
-		const auto propertyValue = *property->ContainerPtrToValuePtr<int>(data);
+		auto numericProperty = static_cast<FNumericProperty*>(property);
+		auto valuePtr = propertyStorage;
+		const bool isUnsigned = property->IsA<FUInt32Property>() || property->IsA<FUInt64Property>();
+		const uint64 unsignedValue = isUnsigned ? numericProperty->GetUnsignedIntPropertyValue(valuePtr) : 0;
+		if (isUnsigned && unsignedValue > static_cast<uint64>(std::numeric_limits<int64>::max()))
+			throw std::format_error("Unsigned integer exceeds Lua integer range");
+		const int64 propertyValue = isUnsigned
+			? static_cast<int64>(unsignedValue)
+			: numericProperty->GetSignedIntPropertyValue(valuePtr);
 		switch (propertyType)
 		{
 		case PropertyType::Array:
@@ -144,7 +157,7 @@ void ModStatics::ExportPropertyAsTable(
 	}
 	else if (property->IsA<FEnumProperty>() || property->IsA<FByteProperty>())
 	{
-		const auto propertyValueRaw = *property->ContainerPtrToValuePtr<uint8>(data);
+		const auto propertyValueRaw = *static_cast<uint8*>(propertyStorage);
 		const int propertyValue = static_cast<int>(propertyValueRaw);
 		switch (propertyType)
 		{
@@ -160,7 +173,7 @@ void ModStatics::ExportPropertyAsTable(
 	}
 	else if (property->IsA<FUInt16Property>())
 	{
-		const auto propertyValueRaw = *property->ContainerPtrToValuePtr<uint16>(data);
+		const auto propertyValueRaw = *static_cast<uint16*>(propertyStorage);
 		const int propertyValue = static_cast<int>(propertyValueRaw);
 		switch (propertyType)
 		{
@@ -176,7 +189,8 @@ void ModStatics::ExportPropertyAsTable(
 	}
 	else if (property->IsA<FBoolProperty>())
 	{
-		const auto propertyValue = *property->ContainerPtrToValuePtr<bool>(data);
+		auto boolProperty = static_cast<FBoolProperty*>(property);
+		const auto propertyValue = boolProperty->GetPropertyValue(propertyStorage);
 		switch (propertyType)
 		{
 		case PropertyType::Array:
@@ -202,7 +216,7 @@ void ModStatics::ExportPropertyAsTable(
 		if (structName == STR("Vector"))
 		{
 
-			auto propertyValue = property->ContainerPtrToValuePtr<FVector>(data);
+			auto propertyValue = static_cast<FVector*>(propertyStorage);
 			if (propertyValue)
 			{
 				if (propertyType != PropertyType::Array)
@@ -220,7 +234,7 @@ void ModStatics::ExportPropertyAsTable(
 		}
 		else if (structName == STR("Rotator"))
 		{
-			auto propertyValue = property->ContainerPtrToValuePtr<FRotator>(data);
+			auto propertyValue = static_cast<FRotator*>(propertyStorage);
 
 			if (propertyType != PropertyType::Array)
 				table.add_key(propName.c_str());
@@ -237,7 +251,7 @@ void ModStatics::ExportPropertyAsTable(
 		else if (structName == STR("Guid"))
 		{
 			FString value;
-			auto propertyValue = property->ContainerPtrToValuePtr<void>(data);
+			auto propertyValue = propertyStorage;
 			property->ExportTextItem(value, propertyValue, nullptr, static_cast<UObject*>(data), 0);
 			const auto str = to_string(*value);
 			switch (propertyType)
@@ -251,7 +265,7 @@ void ModStatics::ExportPropertyAsTable(
 		}
 		else
 		{
-			auto propertyValue = property->ContainerPtrToValuePtr<void>(data);
+			auto propertyValue = propertyStorage;
 			auto structProp = static_cast<FStructProperty*>(property);
 
 			if (propertyType != PropertyType::Array)
@@ -279,7 +293,7 @@ void ModStatics::ExportPropertyAsTable(
 			throw std::format_error("Unable to set array within an array");
 
 		auto _prop = static_cast<FArrayProperty*>(property);
-		auto propertyValue = property->ContainerPtrToValuePtr<FScriptArray>(data);
+		auto propertyValue = static_cast<FScriptArray*>(propertyStorage);
 
 		table.add_key(propName.c_str());
 		auto innerTable = table.get_lua_instance().prepare_new_table();
@@ -305,7 +319,7 @@ void ModStatics::ExportPropertyAsTable(
 				auto elem = static_cast<uint8*>(propertyValue->GetData()) + offset;
 				try
 				{
-					ExportPropertyAsTable(innerProp, elem, innerTable, PropertyType::Array, depth);
+					ExportPropertyAsTable(innerProp, elem, innerTable, PropertyType::Array, depth, true);
 				}
 				catch (const std::exception&)
 				{
@@ -330,7 +344,7 @@ void ModStatics::ExportPropertyAsTable(
 		if (propertyType == PropertyType::Array)
 			throw std::format_error("Unable to explicitly iterate array");
 
-		auto propertyValue = *property->ContainerPtrToValuePtr<UObject*>(data);
+		auto propertyValue = *static_cast<UObject**>(propertyStorage);
 
 		if (propertyValue)
 		{
@@ -364,7 +378,7 @@ void ModStatics::ExportPropertyAsTable(
 			throw std::format_error("Unable to iterate TMap");
 
 		auto innerProp = static_cast<FMapProperty*>(property);
-		auto propertyValue = property->ContainerPtrToValuePtr<FScriptMap>(data);
+		auto propertyValue = static_cast<FScriptMap*>(propertyStorage);
 
 		if (innerProp && propertyValue)
 		{
@@ -383,12 +397,13 @@ void ModStatics::ExportPropertyAsTable(
 					valueProp->GetSize(),
 					valueProp->GetMinAlignment());
 
-				for (int32 i = 0; i < mapSize; i++)
+				for (int32 i = 0; i < mapSize; ++i)
 				{
+					if (!propertyValue->IsValidIndex(i)) continue;
 					auto elem = static_cast<uint8*>(propertyValue->GetData(i, layout));
 					try
 					{
-						ExportPropertyAsTable(keyProp, elem, innerTable, PropertyType::Map, depth);
+						ExportPropertyAsTable(keyProp, elem, innerTable, PropertyType::Map, depth, true);
 					}
 					catch (std::exception& err)
 					{
@@ -403,7 +418,7 @@ void ModStatics::ExportPropertyAsTable(
 					}
 					try
 					{
-						ExportPropertyAsTable(valueProp, elem, innerTable, PropertyType::Array, depth);
+						ExportPropertyAsTable(valueProp, elem + layout.ValueOffset, innerTable, PropertyType::Array, depth, true);
 					}
 					catch (const std::exception& e)
 					{
@@ -437,7 +452,7 @@ void ModStatics::ExportPropertyAsTable(
 			throw std::format_error("Unable to set TSet as array");
 
 		auto setProp = static_cast<FSetProperty*>(property);
-		auto setValue = property->ContainerPtrToValuePtr<void>(data);
+		auto setValue = propertyStorage;
 
 		table.add_key(propName.c_str());
 		auto innerTable = table.get_lua_instance().prepare_new_table();
@@ -451,19 +466,19 @@ void ModStatics::ExportPropertyAsTable(
 
 		auto innerProp = setProp->GetElementProp();
 
-		FScriptSetHelper helper(setProp, setValue);
+		auto scriptSet = static_cast<FScriptSet*>(setValue);
+		auto layout = FScriptSet::GetScriptLayout(innerProp->GetSize(), innerProp->GetMinAlignment());
 
-		if (helper.Num() > 0)
+		if (scriptSet->Num() > 0)
 		{
-			for (int32 i = 0; i < helper.Num(); i++)
-			{
-				if (helper.IsValidIndex(i))
+			int32 outputIndex = 1;
+			ForEachOccupiedSlot(scriptSet->GetMaxIndex(), [&](int32 i) { return scriptSet->IsValidIndex(i); }, [&](int32 i) {
 				{
-					innerTable.add_key(i + 1);
-					uint8* elemPtr = helper.GetElementPtr(i);
+					innerTable.add_key(outputIndex++);
+					uint8* elemPtr = static_cast<uint8*>(scriptSet->GetData(i, layout));
 					try
 					{
-						ExportPropertyAsTable(innerProp, elemPtr, innerTable, PropertyType::Array, depth);
+						ExportPropertyAsTable(innerProp, elemPtr, innerTable, PropertyType::Array, depth, true);
 					}
 					catch (std::exception&)
 					{
@@ -473,7 +488,7 @@ void ModStatics::ExportPropertyAsTable(
 					}
 					innerTable.fuse_pair();
 				}
-			}
+			});
 		}
 		else
 		{

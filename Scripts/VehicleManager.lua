@@ -297,16 +297,25 @@ local function HandleGetVehicles(session)
   local isPlayerControlled = session.queryComponents.isPlayerControlled == "true" or false
   local depth = tonumber(session.queryComponents.depth)
 
-  local getTime, data = timer.benchmark(GetVehicles, id, fields, limit, isPlayerControlled, depth)
-  LogOutput("DEBUG", "GetVehicles time: %fs", getTime)
-
-  if id and #data == 0 then
-    return json.stringify { message = string.format("Vehicle with ID %s not found", id) }, nil, 404
+  if limit and (limit < 1 or limit > 500) then
+    return json.stringify { error = "limit must be between 1 and 500" }, nil, 400
+  end
+  if depth and (depth < 0 or depth > 8) then
+    return json.stringify { error = "depth must be between 0 and 8" }, nil, 400
   end
 
-  local stringifyTime, res = timer.benchmark(json.stringify, { data = data })
-  LogOutput("DEBUG", "GetVehicles stringify time: %fs", stringifyTime)
-  return res, nil, 200
+  local token, deadline = RequestAsyncSnapshot(
+    "vehicles", id and tostring(id) or nil, fields, limit, isPlayerControlled, depth, 2000)
+  return {
+    snapshotToken = token,
+    deadline = deadline,
+    complete = function(data)
+      if id and #data == 0 then
+        return json.stringify { message = string.format("Vehicle with ID %s not found", id) }, nil, 404
+      end
+      return json.stringify { schemaVersion = 2, data = data }, nil, 200
+    end
+  }
 end
 
 ---Handle vehicle despawn request

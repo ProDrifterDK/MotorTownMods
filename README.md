@@ -22,6 +22,14 @@ python3 tools/verify_compatibility.py \
 
 The verifier emits JSON and exits nonzero if the size, SHA-256, signature count, or exact offsets differ. In particular, missing or extra FText candidates fail closed.
 
+A separate B1104 identity contract is recorded in [`compatibility/motortown-0.7.19-b1104.json`](./compatibility/motortown-0.7.19-b1104.json). It validates only the exact B1104 executable identity and observed AOB offsets. It does not validate ABI, reflected layouts, GameThread identity, or runtime safety. Those fields remain explicitly pending.
+
+## Snapshot API safety
+
+`GET /vehicles` and `GET /players` now use snapshot schema version 2. The HTTP worker validates the query, queues a bounded token, and polls a copied native value tree. Live UObjects, FNames, arrays, maps, and sets are read only by the EngineTick-backed GameThread dispatcher. Object references are returned as copied type/stable-ID records and are not recursively expanded. `VehicleReplicatedMovement` has a fixed movement-only projection.
+
+Other routes in the legacy Lua API still traverse engine state directly. They now fail closed with HTTP 503 until each route is migrated to a bounded GameThread snapshot or command contract. This is an intentional compatibility break: preserving unsafe behavior would violate the crash-fix invariant.
+
 ## Usage
 
 Upstream releases use a forked UE4SS release available [here](https://github.com/drpsyko101/RE-UE4SS/releases). Those artifacts are not proof of B1088 runtime support. B1088 testing must use a reviewed build from the commits pinned in the compatibility manifest and must pass the disposable canary gate above.
@@ -126,6 +134,12 @@ Most of the server settings can be configured using environment variables:
 | `MOD_SERVER_API_URL`        | _none_        | Server API to call from client side                                                                                        |
 | `MOD_SERVER_PASSWORD`       | _none_        | Authenticate server request with `Authorization: Basic ` header                                                            |
 | `MOD_SERVER_SEND_PARTIAL`   | _none_        | Limit server response chunks to 40 bytes (Set to `true` for older `luasocket` compatibility)                               |
+| `MOD_SERVER_MAX_BODY_BYTES` | `1048576` | Reject larger HTTP request bodies before socket allocation. |
+| `MOD_WEBHOOK_MAX_BACKLOG_ITEMS` | `256` | Maximum queued webhook events; oldest entries are discarded first. |
+| `MOD_WEBHOOK_MAX_BACKLOG_BYTES` | `1048576` | Maximum estimated queued webhook payload bytes. |
+| `MOD_WEBHOOK_BACKLOG_TTL_MS` | `60000` | Expire unsent webhook events and invoke callbacks with failure. |
+| `MOD_WEBHOOK_MAX_BATCH_ITEMS` | `64` | Maximum events in one webhook request. |
+| `MOD_WEBHOOK_MAX_BATCH_BYTES` | `262144` | Maximum estimated payload bytes in one webhook batch. |
 
 Address precedence is server-specific and backward-compatible:
 

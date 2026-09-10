@@ -1,0 +1,125 @@
+{
+  "schema_version": 2,
+  "game": {
+    "name": "Motor Town: Behind The Wheel",
+    "version": "0.7.19",
+    "build": "B1104",
+    "steam_dedicated_server_app_id": 2223650
+  },
+  "binary": {
+    "product": "Motor Town dedicated server",
+    "filename": "MotorTownServer-Win64-Shipping.exe",
+    "archived_evidence_filename": "MotorTownServer-B1104.exe",
+    "size": 156095488,
+    "sha256": "B8BD6A4D4E7A4B27A8B0846AB98849C87B2FF56D0F96317F36C50C5069B854F9"
+  },
+  "evidence": {
+    "status": "static_identity_verified_abi_runtime_pending",
+    "runtime_verified": false,
+    "deployment_approved": false,
+    "source": "motortown-leak-investigation/binaries/MotorTownServer-Win64-Shipping.exe"
+  },
+  "snapshot_contract": {
+    "schema_version": 2,
+    "projections": {
+      "vehicles": {
+        "always": [
+          "Net_VehicleId"
+        ],
+        "default": [
+          "Net_VehicleId",
+          "Net_LastMovementOwnerPCName",
+          "Net_OwnerCharacterId",
+          "VehicleReplicatedMovement"
+        ],
+        "object_references": "type_and_stable_id_only",
+        "Net_Parts": {
+          "fields": [
+            "Slot",
+            "Key",
+            "Damage"
+          ],
+          "arbitrary_nested_recursion": false
+        }
+      },
+      "players": {
+        "always": [
+          "UniqueID"
+        ],
+        "default": [
+          "Score",
+          "Ping",
+          "bIsAdmin",
+          "bIsHost",
+          "CharacterGuid",
+          "VehicleKey",
+          "Name"
+        ],
+        "object_references": "type_and_stable_id_only"
+      },
+      "VehicleReplicatedMovement": {
+        "fields": [
+          "Location",
+          "Velocity",
+          "Throttle",
+          "Brake",
+          "HandBrake",
+          "Quat",
+          "AngularVelocityInRadian",
+          "Rotation",
+          "LinearVelocity",
+          "AngularVelocity",
+          "VehicleId",
+          "ControllerId",
+          "bSimulatedPhysicSleep",
+          "bRepPhysics"
+        ],
+        "arbitrary_object_recursion": false
+      }
+    },
+    "verified_in_source": true,
+    "runtime_layouts_verified": false,
+    "runtime_verification_required": [
+      "EngineTick executes on the Motor Town B1104 GameThread",
+      "reflected property names and layouts match every projection",
+      "FText constructor candidate is disambiguated by SEH-protected round trip",
+      "GUObjectArray resolves to a valid live object array"
+    ]
+  },
+  "toolchain": {
+    "ue4ss": {
+      "repository": "drpsyko101/RE-UE4SS",
+      "base_commit": "0a7434d97505c0f5c916e84ff8fc2f7bef794405"
+    },
+    "uepseudo": {
+      "repository": "Re-UE4SS/UEPseudo",
+      "commit": "121f2ff12e82e7bdbcfc6cb441a72941378a5dc8"
+    }
+  },
+  "signatures": [
+    {
+      "name": "FText_Constructor",
+      "pattern": "40 53 57 48 83 EC 38 48 89 6C 24 58 48 8B FA",
+      "expected_count": 2,
+      "expected_offsets": [
+        "0x12E5540",
+        "0x12F0C10"
+      ],
+      "runtime_disambiguation_required": true
+    },
+    {
+      "name": "GUObjectArray",
+      "pattern": "48 8D 0D ?? ?? ?? ?? 48 8B D7 89 5C 24 20 44 8D 4B ??",
+      "expected_count": 1,
+      "expected_offsets": [
+        "0x15FEC7A"
+      ],
+      "runtime_resolution_required": true
+    }
+  ],
+  "limitations": [
+    "Exact identity and AOB offsets do not validate ABI or runtime safety.",
+    "B1104 runtime layouts, FText candidate selection, GUObjectArray resolution, EngineTick thread identity, hooks, and snapshot projections require a disposable canary.",
+    "deployment_approved remains false; no live-server action is authorized by this contract."
+  ]
+}

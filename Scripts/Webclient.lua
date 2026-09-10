@@ -125,9 +125,28 @@ local function CreateWebhookRequest(content)
     end)
 end
 
----Request pool
----@type [table, fun(status: boolean)?][]
+---Bounded webhook backlog. Oldest entries are discarded when count/byte limits
+---are reached; expired entries are rejected before any network request.
+local maxBacklogItems = tonumber(os.getenv("MOD_WEBHOOK_MAX_BACKLOG_ITEMS")) or 256
+local maxBacklogBytes = tonumber(os.getenv("MOD_WEBHOOK_MAX_BACKLOG_BYTES")) or (1024 * 1024)
+local maxBatchItems = tonumber(os.getenv("MOD_WEBHOOK_MAX_BATCH_ITEMS")) or 64
+local maxBatchBytes = tonumber(os.getenv("MOD_WEBHOOK_MAX_BATCH_BYTES")) or (256 * 1024)
+local backlogTtlMs = tonumber(os.getenv("MOD_WEBHOOK_BACKLOG_TTL_MS")) or 60000
+---@type table[]
 local requests = {}
+local requestBytes = 0
+
+local function discardRequest(entry, reason)
+    requestBytes = math.max(0, requestBytes - entry.bytes)
+    LogOutput("WARN", "Discarding webhook event (%s)", reason)
+    if entry.callback then pcall(entry.callback, false) end
+end
+
+local function discardExpired(now)
+    while #requests > 0 and now - requests[1].createdAt >= backlogTtlMs do
+        discardRequest(table.remove(requests, 1), "TTL expired")
+    end
+end
 
 ---Create a webhook request from and event and its data.
 ---The request will be made asynchronously
@@ -143,7 +162,19 @@ local function CreateEventWebhook(event, data, callback)
             data = data
         }
         LogOutput("DEBUG", "Collecting payload:\n%s", payload)
-        table.insert(requests, { payload, callback })
+        local now = math.floor(socket.gettime() * 1000)
+        discardExpired(now)
+        local bytes = #json.stringify(payload)
+        if bytes > maxBacklogBytes or bytes > maxBatchBytes then
+            LogOutput("WARN", "Discarding webhook event (payload exceeds byte limit)")
+            if callback then pcall(callback, false) end
+            return
+        end
+        while #requests >= maxBacklogItems or requestBytes + bytes > maxBacklogBytes do
+            discardRequest(table.remove(requests, 1), "backlog limit")
+        end
+        table.insert(requests, { payload = payload, callback = callback, createdAt = now, bytes = bytes })
+        requestBytes = requestBytes + bytes
     end
 end
 
@@ -151,16 +182,21 @@ end
 -- This will slot in between webserver loops.
 local delay = (tonumber(os.getenv("MOD_SERVER_PROCESS_AMOUNT")) or 5) * 100
 LoopAsync(delay, function()
+    discardExpired(math.floor(socket.gettime() * 1000))
     if #requests > 0 then
         local payloads = {} ---@type table[]
         local callbacks = {} ---@type fun(status: boolean)[]
+        local batchBytes = 0
 
-        -- Return the payload in order
-        -- This also takes into account possible table insertion while processing data
-        while #requests ~= 0 do
-            local payload, callback = table.unpack(table.remove(requests, 1))
-            table.insert(payloads, payload)
-            table.insert(callbacks, callback)
+        -- Drain a bounded batch. Remaining entries keep their original TTL.
+        while #requests > 0 and #payloads < maxBatchItems do
+            local entry = requests[1]
+            if #payloads > 0 and batchBytes + entry.bytes > maxBatchBytes then break end
+            table.remove(requests, 1)
+            requestBytes = math.max(0, requestBytes - entry.bytes)
+            batchBytes = batchBytes + entry.bytes
+            table.insert(payloads, entry.payload)
+            if entry.callback then table.insert(callbacks, entry.callback) end
         end
 
         local payload = json.stringify(payloads)

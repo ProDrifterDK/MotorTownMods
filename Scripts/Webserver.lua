@@ -20,6 +20,7 @@ local address = os.getenv("MOD_SERVER_HOST")
     or "127.0.0.1"
 local port = tonumber(os.getenv("MOD_SERVER_PORT")) or 5001
 local isServerRunning = false
+local maxRequestBodyBytes = tonumber(os.getenv("MOD_SERVER_MAX_BODY_BYTES")) or (1024 * 1024)
 local time = function()
     return socket.gettime() * 1000
 end
@@ -38,6 +39,7 @@ local _state = {
     init = "init",
     header = "header",
     body = "body",
+    pending = "pending",
     close = "close"
 }
 
@@ -91,6 +93,8 @@ local _resCode = {
     ["403 Forbidden"] = 403,
     ["404 Not Found"] = 404,
     ["405 Method Not Allowed"] = 405,
+    ["413 Payload Too Large"] = 413,
+    ["504 Gateway Timeout"] = 504,
     ["500 Internal Server Error"] = 500,
     ["503 Service Unavailable"] = 503,
 }
@@ -113,6 +117,7 @@ end
 ---@field method RequestMethod
 ---@field handler RequestPathHandler
 ---@field authenticate boolean
+---@field workerSafe boolean
 local RequestPathHandlerTable = {}
 RequestPathHandlerTable.__index = RequestPathHandlerTable
 
@@ -121,8 +126,9 @@ RequestPathHandlerTable.__index = RequestPathHandlerTable
 ---@param method RequestMethod
 ---@param handler RequestPathHandler
 ---@param authenticate boolean?
+---@param workerSafe boolean?
 ---@return RequestPathHandlerTable
-function RequestPathHandlerTable.new(path, method, handler, authenticate)
+function RequestPathHandlerTable.new(path, method, handler, authenticate, workerSafe)
     local obj = setmetatable({}, RequestPathHandlerTable)
     obj.path = path
     obj.method = method
@@ -132,6 +138,7 @@ function RequestPathHandlerTable.new(path, method, handler, authenticate)
     else
         obj.authenticate = authenticate
     end
+    obj.workerSafe = workerSafe == true
     return obj
 end
 
@@ -235,6 +242,10 @@ end
 ---@param client ClientTable
 local function markSessionForRemoval(client)
     LogOutput("DEBUG", "Marking client %i for removal", client.id)
+    if client.pending then
+        pcall(CancelGameStateSnapshot, client.pending.snapshotToken)
+        client.pending = nil
+    end
     client.state = "close"
 end
 
@@ -401,10 +412,20 @@ local function processSession(client)
             sendResponse(client, nil, nil, 401)
             return
         end
+        if not h.workerSafe then
+            sendResponse(client, json.stringify {
+                error = "Route disabled until its engine access is migrated to a GameThread snapshot"
+            }, nil, 503)
+            return
+        end
 
         local status, content, mime, code = pcall(h.handler, client)
-        -- Check if the handler returned any valid response
-        if status then
+        -- Snapshot handlers return a token and completion function. No UObject,
+        -- socket, or request body crosses into the GameThread callback.
+        if status and type(content) == "table" and content.snapshotToken and content.complete then
+            client.pending = content
+            client.state = "pending"
+        elseif status then
             sendResponse(client, content, mime, code)
         else
             if not pcall(function()
@@ -456,7 +477,12 @@ local function handleClient(client)
     local partial = nil ---@type number?
 
     local state, pErr = pcall(function()
-        if s.state == "init" or s.state == "header" then
+        if s.state == "pending" then
+            -- Readability while waiting means disconnect or unsupported pipelining.
+            -- Cancel now; a late native result cannot be delivered to this session.
+            markSessionForRemoval(s)
+            return
+        elseif s.state == "init" or s.state == "header" then
             data, err, partial = client:receive("*l")
         elseif s.state == "body" then
             data, err, partial = client:receive(s.contentLength)
@@ -502,6 +528,14 @@ local function handleClient(client)
                     end
 
                     processHeaders(s)
+                    if not s.contentLength or s.contentLength < 0 then
+                        sendResponse(s, json.stringify { error = "Invalid Content-Length" }, nil, 400)
+                        return
+                    end
+                    if s.contentLength > maxRequestBodyBytes then
+                        sendResponse(s, json.stringify { error = "Request body exceeds configured limit" }, nil, 413)
+                        return
+                    end
 
                     if s.contentLength == 0 then
                         LogOutput("DEBUG", "Content length = 0, not waiting for content")
@@ -535,12 +569,57 @@ local function handleClient(client)
     end
 end
 
+---Complete pending snapshots without waiting for more socket readability.
+local function pollPendingSnapshots()
+    for _, session in pairs(sessions) do
+        local pending = session.pending
+        if pending and session.state == "pending" then
+            if time() >= pending.deadline then
+                local token = pending.snapshotToken
+                session.pending = nil
+                pcall(CancelGameStateSnapshot, token)
+                local body = json.stringify { error = "Snapshot deadline exceeded" }
+                local sent, err = pcall(sendResponse, session, body, nil, 504)
+                if not sent then
+                    LogOutput("ERROR", "Snapshot timeout response failed: %s", err)
+                    markSessionForRemoval(session)
+                end
+            else
+                local ok, state, value = pcall(PollGameStateSnapshot, pending.snapshotToken)
+                if not ok or state == "error" or state == "missing" then
+                    session.pending = nil
+                    local message = ok and (value or "Snapshot was cancelled") or state
+                    local body = json.stringify { error = message }
+                    local sent, err = pcall(sendResponse, session, body, nil, 503)
+                    if not sent then
+                        LogOutput("ERROR", "Snapshot error response failed: %s", err)
+                        markSessionForRemoval(session)
+                    end
+                elseif state == "ready" then
+                    -- Remove token authority before any fallible serialization or send.
+                    session.pending = nil
+                    local completed, content, mime, code = pcall(pending.complete, value)
+                    if not completed then
+                        content, mime, code = json.stringify { error = content }, nil, 500
+                    end
+                    local sent, err = pcall(sendResponse, session, content, mime, code)
+                    if not sent then
+                        LogOutput("ERROR", "Snapshot response failed: %s", err)
+                        markSessionForRemoval(session)
+                    end
+                end
+            end
+        end
+    end
+end
+
 ---Wait the given amount of time for some data to process. If data received, it will be processed and this
 ---method will return. If no data, it will timeout and return. The caller should not know or care which happened.
 ---
 ---Note that if there is data to process this method may return sooner or later than the timeout time.
 ---@param timeout number Socket selection timeout in seconds
 local function process(timeout)
+    pollPendingSnapshots()
     local rclients, _, err = socket.select(clients, nil, timeout)
     ---@cast rclients TCPSocketClient[]
     if err ~= nil then
@@ -559,6 +638,8 @@ local function process(timeout)
             end
         end
     end
+
+    pollPendingSnapshots()
 
     -- Cleanup phase: remove closed sessions
     local i = #clients
@@ -580,8 +661,9 @@ end
 ---@param method RequestMethod request type (e.g. `GET`, `POST`)
 ---@param handler RequestPathHandler request handler function
 ---@param authenticate boolean? Should the handler be authenticated. Defaults to true
-local function registerHandler(path, method, handler, authenticate)
-    local h = RequestPathHandlerTable.new(path, method, handler, authenticate)
+---@param workerSafe boolean? True only when the handler never traverses live engine state in this worker
+local function registerHandler(path, method, handler, authenticate, workerSafe)
+    local h = RequestPathHandlerTable.new(path, method, handler, authenticate, workerSafe)
     -- Already registered?
     local i = findHandlerIndex(path, method)
     if i == nil then
@@ -612,6 +694,18 @@ local function init(host, initPort)
     table.insert(clients, g_server)
 end
 
+local function shutdown(reason)
+    if reason then LogOutput("ERROR", "Webserver worker failed: %s", reason) end
+    isServerRunning = false
+    for _, session in pairs(sessions) do
+        markSessionForRemoval(session)
+    end
+    for _, client in ipairs(clients) do pcall(function() client:close() end) end
+    clients = {}
+    sessions = {}
+    g_server = nil
+end
+
 ---Start the web server
 ---@param bindHost string? Host IP to bind to
 ---@param bindPort number? Port to bind to
@@ -623,7 +717,7 @@ local function run(bindHost, bindPort)
     registerHandler("/stop", "POST", function(session)
         isServerRunning = false
         return json.stringify { status = "ok" }, nil, 202
-    end)
+    end, true, true)
 
     init(bindHost, bindPort)
     isServerRunning = true
@@ -632,11 +726,18 @@ local function run(bindHost, bindPort)
         -- Increasing the amount of process further decreases total latency but will block async thread by the amount * timeout
         -- Best to keep the amount low to allow for other function to use ExecuteAsync
         local count = 0
-        while count < procAmount do
-            process(0.1)
-            count = count + 1
+        local ok, err = xpcall(function()
+            while count < procAmount do
+                process(0.1)
+                count = count + 1
+            end
+        end, debug.traceback)
+        if not ok then
+            shutdown(err)
+            return true
         end
         if not isServerRunning then
+            shutdown()
             LogOutput("INFO", "Webserver stopped")
         end
         return not isServerRunning

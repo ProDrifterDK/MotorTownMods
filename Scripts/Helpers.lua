@@ -434,16 +434,59 @@ function Sleep(ms)
   end
 end
 
----Execute given function in the GameThread
+---Execute given function in the GameThread.
+---Legacy synchronous callers have a deadline and propagate callback errors.
 ---@param exec fun()
-function ExecuteInGameThreadSync(exec)
-  local isProcessing = true
+---@param timeoutMs integer?
+function ExecuteInGameThreadSync(exec, timeoutMs)
+  local completed = false
+  local callbackError = nil
+  local deadline = (socket and socket.gettime() * 1000 or os.clock() * 1000) + (timeoutMs or 2000)
   ExecuteInGameThread(function()
-    exec()
-    isProcessing = false
+    local ok, err = pcall(exec)
+    if not ok then callbackError = err end
+    completed = true
   end)
 
-  while isProcessing do
+  while not completed do
+    local now = socket and socket.gettime() * 1000 or os.clock() * 1000
+    if now >= deadline then error("GameThread action deadline exceeded") end
     Sleep(1)
   end
+  if callbackError then error(callbackError) end
+end
+
+---Begin a bounded native snapshot and enqueue only its numeric token for capture.
+---The closure owns no socket, session, request body, UObject, or Lua userdata.
+---@param kind "vehicles"|"players"
+---@param id string?
+---@param fields string[]?
+---@param limit integer?
+---@param controlledOnly boolean?
+---@param depth integer?
+---@param timeoutMs integer?
+---@return integer token
+---@return integer deadlineMs
+function RequestAsyncSnapshot(kind, id, fields, limit, controlledOnly, depth, timeoutMs)
+  timeoutMs = math.max(50, math.min(timeoutMs or 2000, 5000))
+  limit = math.max(1, math.min(limit or 100, 500))
+  depth = math.max(0, math.min(depth or 2, 8))
+  local token = RequestGameStateSnapshot(
+    kind,
+    id or "",
+    table.concat(fields or {}, ","),
+    limit,
+    controlledOnly == true,
+    depth,
+    timeoutMs
+  )
+  local queued, err = pcall(ExecuteInGameThread, function()
+    CaptureGameStateSnapshot(token)
+  end)
+  if not queued then
+    CancelGameStateSnapshot(token)
+    error(err)
+  end
+  local now = socket and socket.gettime() * 1000 or os.clock() * 1000
+  return token, now + timeoutMs
 end

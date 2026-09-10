@@ -133,13 +133,21 @@ local function HandleGetPlayerStates(session)
   local playerId = session.pathComponents[2]
   local filters = SplitString(session.queryComponents.filters, ",")
   local depth = tonumber(session.queryComponents.depth)
-  local res = GetPlayerStates(playerId, filters, depth)
-
-  if playerId and #res == 0 then
-    return json.stringify { message = string.format("Player with unique ID %s not found", playerId) }, nil, 404
+  if depth and (depth < 0 or depth > 8) then
+    return json.stringify { error = "depth must be between 0 and 8" }, nil, 400
   end
 
-  return json.stringify { data = res }, nil, 200
+  local token, deadline = RequestAsyncSnapshot("players", playerId, filters, 100, false, depth, 2000)
+  return {
+    snapshotToken = token,
+    deadline = deadline,
+    complete = function(data)
+      if playerId and #data == 0 then
+        return json.stringify { message = string.format("Player with unique ID %s not found", playerId) }, nil, 404
+      end
+      return json.stringify { schemaVersion = 2, data = data }, nil, 200
+    end
+  }
 end
 
 ---Handle request to teleport player
