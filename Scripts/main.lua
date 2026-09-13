@@ -108,5 +108,42 @@ local function LoadWebserver()
   end
 end
 
+---Game-thread pump self-probe (D2 diagnostic): 10s after boot, request one
+---vehicles snapshot and check whether the capture callback ever executed.
+---If the game-thread pump is broken on this target, this logs a single loud
+---ERROR with the token state instead of leaving every /vehicles and /players
+---request to 504 with an ambiguous "deadline exceeded".
+local function StartGameThreadPumpProbe()
+  local socket = require("socket")
+  LoopAsync(10000, function()
+    LogOutput("INFO", "GameThread pump probe: requesting a snapshot")
+    local ok, tokenOrErr = pcall(function()
+      return RequestAsyncSnapshot("vehicles", nil, {}, 5, false, 0, 2000)
+    end)
+    if not ok then
+      LogOutput("ERROR", "GameThread pump probe: RequestAsyncSnapshot failed: %s", tokenOrErr)
+      return true
+    end
+    local token = tokenOrErr
+    local deadline = (socket.gettime() * 1000) + 3000
+    while socket.gettime() * 1000 < deadline do
+      local okPoll, state = pcall(PollGameStateSnapshot, token)
+      if not okPoll then
+        LogOutput("ERROR", "GameThread pump probe: poll errored")
+        return true
+      end
+      if state ~= "pending" then
+        LogOutput("INFO", "GameThread pump probe: capture state reached '%s' - pump is alive", state)
+        return true
+      end
+      Sleep(50)
+    end
+    LogOutput("ERROR", "GameThread pump probe: capture callback never executed within 3s (token still pending) - the game-thread pump is NOT running on this target; /vehicles and /players will 504")
+    pcall(CancelGameStateSnapshot, token)
+    return true
+  end)
+end
+
 LoadWebserver()
+StartGameThreadPumpProbe()
 LogOutput("INFO", "Mod loaded")

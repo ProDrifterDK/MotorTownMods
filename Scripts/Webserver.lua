@@ -233,7 +233,7 @@ local function buildHeaders(content, contentType, resCode, timestamp)
         add("Content-type", contentType)
     end
 
-    local header = table.concat(h, "\n") .. "\n\n"
+    local header = table.concat(h, "\r\n") .. "\r\n\r\n"
     LogOutput("DEBUG", "Adding header: %s", header)
     return header
 end
@@ -577,8 +577,24 @@ local function pollPendingSnapshots()
             if time() >= pending.deadline then
                 local token = pending.snapshotToken
                 session.pending = nil
+                -- Distinguish "the capture callback never executed on the game
+                -- thread" (token still Queued/Capturing -> poll says "pending")
+                -- from "the capture ran but was too slow to finish in time"
+                -- (poll would have returned ready/error, and take() erased the
+                -- entry). Poll BEFORE cancel: cancel erases the entry and a
+                -- post-cancel poll can only say "missing", which is ambiguous.
+                -- Store::take consumes terminal entries; a second poll after a
+                -- pending result is therefore still safe and order-stable.
+                local okPoll, pollState = pcall(PollGameStateSnapshot, token)
+                local body
+                if not okPoll then
+                    body = json.stringify { error = "Snapshot deadline exceeded (post-deadline poll errored)" }
+                elseif pollState == "pending" then
+                    body = json.stringify { error = "Snapshot deadline exceeded: capture callback never executed (game-thread pump did not run)", token_state = pollState }
+                else
+                    body = json.stringify { error = "Snapshot deadline exceeded", token_state = pollState }
+                end
                 pcall(CancelGameStateSnapshot, token)
-                local body = json.stringify { error = "Snapshot deadline exceeded" }
                 local sent, err = pcall(sendResponse, session, body, nil, 504)
                 if not sent then
                     LogOutput("ERROR", "Snapshot timeout response failed: %s", err)
