@@ -77,6 +77,7 @@ namespace MotorTown::Snapshot
 
         static auto begin(Query query) -> uint64_t;
         static auto capture(uint64_t request_id) -> void;
+        static auto fail(uint64_t request_id, std::string error) -> bool;
         static auto take(uint64_t request_id) -> std::optional<Result>;
         static auto cancel(uint64_t request_id) -> bool;
         static auto cancel_all() -> void;

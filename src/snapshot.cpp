@@ -551,6 +551,20 @@ namespace MotorTown::Snapshot
         return s_entries.erase(request_id) != 0;
     }
 
+    auto Store::fail(uint64_t request_id, std::string error) -> bool
+    {
+        // Run-13 RCA (D2): a queued game-thread callback that cannot capture
+        // must leave an OBSERVABLE terminal state, never a silent Queued entry
+        // that every poll reports as "pending" until the caller's deadline.
+        // Only a Queued entry can be failed: a Capturing entry belongs to
+        // Store::capture, and a terminal state is already observable.
+        std::lock_guard guard{s_mutex};
+        auto found = s_entries.find(request_id);
+        if (found == s_entries.end() || found->second.result.state != State::Queued) return false;
+        found->second.result = Result{State::Error, {}, std::move(error)};
+        return true;
+    }
+
     auto Store::cancel_all() -> void
     {
         std::lock_guard guard{s_mutex};

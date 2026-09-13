@@ -58,7 +58,12 @@ class SnapshotRegressionTests(unittest.TestCase):
         reader = (ROOT / "src/snapshot.cpp").read_text()
         self.assertIn('static_cast<FName*>(storage)->ToString()', reader)
         self.assertIn('CaptureGameStateSnapshot', source)
-        self.assertIn('require_game_thread(lua, "CaptureGameStateSnapshot")', source)
+        # Run-13 RCA (D2): the capture binding no longer uses the generic
+        # require_game_thread throw (a silent swallow inside a queued action
+        # left the entry pending forever); it must fail CLOSED by recording a
+        # typed Store error before refusing the engine-state read.
+        self.assertIn('MotorTown::Snapshot::Store::fail(', source)
+        self.assertIn('is_in_game_thread()', source.split('capture_game_state_snapshot', 1)[1].split('poll_game_state_snapshot', 1)[0])
 
     def test_snapshot_results_are_owned_values_and_bounded(self):
         header = (ROOT / "src/snapshot.h").read_text()

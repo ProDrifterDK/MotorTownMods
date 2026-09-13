@@ -118,6 +118,17 @@ end
 local function StartGameThreadPumpProbe()
   local socket = require("socket")
   LoopAsync(10000, function()
+    -- Run-13 RCA (D2) arm A: a PURE game-thread callback with no snapshot
+    -- involvement. If this line appears, the UE4SS EngineTick action pump
+    -- runs on the B1104 dedicated target and any pending snapshot is a
+    -- capture-path defect; if it never appears, the game-thread action pump
+    -- itself never runs and the snapshot cannot be the only broken surface.
+    local okAlive, aliveErr = pcall(ExecuteInGameThread, function()
+      LogOutput("INFO", "GameThread pump probe: pump-alive (pure game-thread callback executed)")
+    end)
+    if not okAlive then
+      LogOutput("ERROR", "GameThread pump probe: pump-alive queue refused: %s", tostring(aliveErr))
+    end
     LogOutput("INFO", "GameThread pump probe: requesting a snapshot")
     local ok, tokenOrErr = pcall(function()
       return RequestAsyncSnapshot("vehicles", nil, {}, 5, false, 0, 2000)

@@ -118,7 +118,25 @@ namespace
 
     auto capture_game_state_snapshot(const LuaMadeSimple::Lua& lua) -> int
     {
-        require_game_thread(lua, "CaptureGameStateSnapshot");
+        // Run-13 RCA (D2): when this binding is invoked inside an
+        // ExecuteInGameThread queued action and the game-thread authorization
+        // fails, the former require_game_thread throw died inside the queued
+        // action and left the Store entry Queued forever: every poll reported
+        // "pending" until the caller's deadline, with no observable cause
+        // (the UE4SS queued-action error line was absent from UE4SS.log).
+        // Fail CLOSED instead: record a typed Store error so the poll returns
+        // "error" with an actionable reason rather than a silent pending.
+        if (!RC::LuaMod::is_in_game_thread())
+        {
+            if (lua.is_integer(1))
+            {
+                MotorTown::Snapshot::Store::fail(
+                    static_cast<uint64_t>(lua.get_integer(1)),
+                    "CaptureGameStateSnapshot ran outside the GameThread authorization (ExecuteInGameThread callback pumped without is_in_game_thread=true); the engine-state read was refused fail-closed");
+            }
+            lua.throw_error("CaptureGameStateSnapshot may only read engine state on the GameThread; the snapshot request was marked errored");
+            return 0;
+        }
         if (!lua.is_integer(1)) lua.throw_error("CaptureGameStateSnapshot requires a request ID");
         MotorTown::Snapshot::Store::capture(static_cast<uint64_t>(lua.get_integer(1)));
         return 0;
