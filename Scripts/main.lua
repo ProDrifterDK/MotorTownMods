@@ -148,7 +148,16 @@ local function StartGameThreadPumpProbe()
         pcall(CancelGameStateSnapshot, token)
         return true
       end
-      LoopAsync(50, pollStep)
+      -- Admission refusal is a real scheduler behavior (LoopAsync throws
+      -- "LoopAsync refused: too many queued Lua actions" at the 1024-action
+      -- cap). If the successor cannot be admitted, this callback is the
+      -- token's last owner: cancel defensively and exit with a diagnostic.
+      local okSchedule, scheduleErr = pcall(LoopAsync, 50, pollStep)
+      if not okSchedule then
+        LogOutput("ERROR", "GameThread pump probe: reschedule refused (%s); token cancelled, capture completion not observed", tostring(scheduleErr))
+        pcall(CancelGameStateSnapshot, token)
+        return true
+      end
       return true
     end
     pollStep()
