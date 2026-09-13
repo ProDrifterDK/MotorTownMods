@@ -577,20 +577,20 @@ local function pollPendingSnapshots()
             if time() >= pending.deadline then
                 local token = pending.snapshotToken
                 session.pending = nil
-                -- Distinguish "the capture callback never executed on the game
-                -- thread" (token still Queued/Capturing -> poll says "pending")
-                -- from "the capture ran but was too slow to finish in time"
-                -- (poll would have returned ready/error, and take() erased the
-                -- entry). Poll BEFORE cancel: cancel erases the entry and a
-                -- post-cancel poll can only say "missing", which is ambiguous.
-                -- Store::take consumes terminal entries; a second poll after a
-                -- pending result is therefore still safe and order-stable.
+                -- Poll BEFORE cancel: cancel erases the entry and a post-cancel
+                -- poll can only say "missing", which is ambiguous. Store::take
+                -- consumes terminal entries, so a poll after a pending result
+                -- is safe and order-stable. The native Queued and Capturing
+                -- states both project to "pending", so a pending poll result
+                -- only proves that no completion was observed; it does NOT
+                -- distinguish a dead pump from a capture that started late or
+                -- is still running. The message must not over-claim.
                 local okPoll, pollState = pcall(PollGameStateSnapshot, token)
                 local body
                 if not okPoll then
                     body = json.stringify { error = "Snapshot deadline exceeded (post-deadline poll errored)" }
                 elseif pollState == "pending" then
-                    body = json.stringify { error = "Snapshot deadline exceeded: capture callback never executed (game-thread pump did not run)", token_state = pollState }
+                    body = json.stringify { error = "Snapshot deadline exceeded: capture completion not observed (token still pending)", token_state = pollState }
                 else
                     body = json.stringify { error = "Snapshot deadline exceeded", token_state = pollState }
                 end

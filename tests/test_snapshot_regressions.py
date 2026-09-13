@@ -76,7 +76,18 @@ class SnapshotRegressionTests(unittest.TestCase):
         source = (ROOT / "Scripts/Webserver.lua").read_text()
         self.assertIn('pending = "pending"', source)
         self.assertIn("pollPendingSnapshots()", source)
-        self.assertIn("session.pending = nil\n                pcall(CancelGameStateSnapshot", source)
+        # Lifecycle-order evidence: token authority is released before any
+        # fallible serialization/send, the post-deadline poll happens BEFORE
+        # the cancel (cancel erases the entry, making the state ambiguous),
+        # and the cancel always runs after the poll on the timeout path.
+        self.assertIn("session.pending = nil", source)
+        self.assertIn("local okPoll, pollState = pcall(PollGameStateSnapshot, token)", source)
+        self.assertIn("pcall(CancelGameStateSnapshot, token)", source)
+        timeout_block = source[source.index("if time() >= pending.deadline"):]
+        timeout_block = timeout_block[:timeout_block.index("local sent, err = pcall(sendResponse")]
+        poll_at = timeout_block.index("pcall(PollGameStateSnapshot, token)")
+        cancel_at = timeout_block.index("pcall(CancelGameStateSnapshot, token)")
+        self.assertLess(poll_at, cancel_at, "timeout path must poll before cancel")
         self.assertIn("Remove token authority before any fallible serialization or send", source)
         self.assertIn("Route disabled until its engine access is migrated", source)
 

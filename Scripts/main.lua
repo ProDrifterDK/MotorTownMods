@@ -109,10 +109,12 @@ local function LoadWebserver()
 end
 
 ---Game-thread pump self-probe (D2 diagnostic): 10s after boot, request one
----vehicles snapshot and check whether the capture callback ever executed.
----If the game-thread pump is broken on this target, this logs a single loud
----ERROR with the token state instead of leaving every /vehicles and /players
----request to 504 with an ambiguous "deadline exceeded".
+---vehicles snapshot and poll it NON-blockingly: each poll step is its own
+---short LoopAsync callback that returns immediately, so the shared scheduler
+---never stalls and the HTTP loop keeps being serviced between polls. Only
+---ready/error prove that a capture produced a result; missing is treated as
+---an inconclusive diagnostic, and pending at the deadline is reported as
+---"completion not observed" without attributing a cause.
 local function StartGameThreadPumpProbe()
   local socket = require("socket")
   LoopAsync(10000, function()
@@ -120,26 +122,36 @@ local function StartGameThreadPumpProbe()
     local ok, tokenOrErr = pcall(function()
       return RequestAsyncSnapshot("vehicles", nil, {}, 5, false, 0, 2000)
     end)
-    if not ok then
-      LogOutput("ERROR", "GameThread pump probe: RequestAsyncSnapshot failed: %s", tokenOrErr)
+    if not ok or type(tokenOrErr) ~= "number" then
+      LogOutput("ERROR", "GameThread pump probe: RequestAsyncSnapshot failed: %s", tostring(tokenOrErr))
       return true
     end
     local token = tokenOrErr
     local deadline = (socket.gettime() * 1000) + 3000
-    while socket.gettime() * 1000 < deadline do
+    local function pollStep()
       local okPoll, state = pcall(PollGameStateSnapshot, token)
       if not okPoll then
         LogOutput("ERROR", "GameThread pump probe: poll errored")
+        pcall(CancelGameStateSnapshot, token)
         return true
       end
-      if state ~= "pending" then
-        LogOutput("INFO", "GameThread pump probe: capture state reached '%s' - pump is alive", state)
+      if state == "ready" or state == "error" then
+        LogOutput("INFO", "GameThread pump probe: capture reached '%s' - capture path produced a result (pump ran)", state)
         return true
       end
-      Sleep(50)
+      if state == "missing" then
+        LogOutput("INFO", "GameThread pump probe: token missing (entry consumed or cancelled) - inconclusive, no capture result observed")
+        return true
+      end
+      if socket.gettime() * 1000 >= deadline then
+        LogOutput("ERROR", "GameThread pump probe: snapshot still pending after 3s; capture completion not observed (no verdict about the game-thread pump)")
+        pcall(CancelGameStateSnapshot, token)
+        return true
+      end
+      LoopAsync(50, pollStep)
+      return true
     end
-    LogOutput("ERROR", "GameThread pump probe: capture callback never executed within 3s (token still pending) - the game-thread pump is NOT running on this target; /vehicles and /players will 504")
-    pcall(CancelGameStateSnapshot, token)
+    pollStep()
     return true
   end)
 end
