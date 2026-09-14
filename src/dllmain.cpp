@@ -206,14 +206,43 @@ auto MotorTownMods::on_unreal_init() -> void
 		});
 	Unreal::Hook::RegisterInitGameStatePostCallback([](Unreal::AGameModeBase* context) {
 		MotorTown::Snapshot::Store::clear_active_game_state();
-		if (!context) return;
+		// Run-17c RCA diagnostics: every early-return branch must be observable
+		// in UE4SS.log; the snapshot capture path otherwise fails closed with a
+		// generic 'active MotorTownGameState is unavailable' that cannot
+		// distinguish a missing registration from a world-identity mismatch.
+		if (!context)
+		{
+			ModStatics::LogOutput(L"[SnapshotDiag] InitGameState post: context is null; active root cleared");
+			return;
+		}
 		auto* game_state_property = context->GetPropertyByNameInChain(STR("GameState"));
-		if (!game_state_property || !game_state_property->IsA<Unreal::FObjectProperty>()) return;
+		if (!game_state_property || !game_state_property->IsA<Unreal::FObjectProperty>())
+		{
+			const std::wstring class_name = context->GetClassPrivate()
+				? context->GetClassPrivate()->GetFullName()
+				: std::wstring{STR("<null>")};
+			ModStatics::LogOutput(L"[SnapshotDiag] InitGameState post: GameState property missing or not FObjectProperty on GameMode class {}",
+				class_name);
+			return;
+		}
 		auto* storage = game_state_property->ContainerPtrToValuePtr<void>(context);
 		auto* game_state = static_cast<Unreal::FObjectProperty*>(game_state_property)->GetObjectPropertyValue(storage);
 		auto* world = context->GetWorld();
-		if (!game_state || !world || game_state->GetWorld() != world) return;
+		if (!game_state || !world || game_state->GetWorld() != world)
+		{
+			const std::wstring game_state_state = game_state ? STR("present") : STR("null");
+			const std::wstring world_state = world ? STR("present") : STR("null");
+			const std::wstring world_match = (game_state && world && game_state->GetWorld() == world) ? STR("true") : STR("false");
+			ModStatics::LogOutput(L"[SnapshotDiag] InitGameState post: invalid root (game_state={} world={} world_match={})",
+				game_state_state,
+				world_state,
+				world_match);
+			return;
+		}
 		MotorTown::Snapshot::Store::set_active_game_state(game_state, world);
+		ModStatics::LogOutput(L"[SnapshotDiag] InitGameState post: active root registered (game_state={} world={})",
+			game_state->GetName(),
+			world->GetName());
 	});
 
 	// Init API server
