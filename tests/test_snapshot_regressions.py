@@ -120,34 +120,6 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertIn("LuaMod::is_in_game_thread()", guard)
         self.assertNotIn("is_executing_engine_tick_action", guard)
 
-    def test_active_root_rejects_stale_world_after_travel(self):
-        compiler = shutil.which("c++") or shutil.which("g++")
-        if not compiler:
-            self.skipTest("C++ compiler unavailable")
-        source = textwrap.dedent(r"""
-            #include "src/active_snapshot_root.h"
-            #include <cassert>
-            struct World {};
-            struct Root { World* world; World* GetWorld() { return world; } };
-            template <typename T> struct Weak {
-                T* value{};
-                T* Get() const { return value; }
-            };
-            int main() {
-                World old_world, new_world;
-                Root old_root{&old_world};
-                assert(ResolveActiveSnapshotRoot(Weak<Root>{&old_root}, Weak<World>{&old_world}) == &old_root);
-                assert(ResolveActiveSnapshotRoot(Weak<Root>{&old_root}, Weak<World>{&new_world}) == nullptr);
-                assert(ResolveActiveSnapshotRoot(Weak<Root>{}, Weak<World>{&new_world}) == nullptr);
-            }
-        """)
-        with tempfile.TemporaryDirectory() as directory:
-            source_path = Path(directory) / "root.cpp"
-            binary_path = Path(directory) / "root"
-            source_path.write_text(source)
-            subprocess.run([compiler, "-std=c++20", "-I", str(ROOT), str(source_path), "-o", str(binary_path)], check=True)
-            subprocess.run([str(binary_path)], check=True)
-
     def test_root_discovery_is_cached_and_deadline_checked(self):
         source = (ROOT / "src/snapshot.cpp").read_text()
         capture = source.split("auto capture_query", 1)[1].split("auto Store::begin", 1)[0]
@@ -155,7 +127,7 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertIn("Store::resolve_active_game_state()", capture)
         self.assertLess(capture.index("Budget budget"), capture.index("Store::resolve_active_game_state()"))
         root_helper = (ROOT / "src/active_snapshot_root.h").read_text()
-        self.assertIn("ResolveActiveSnapshotRoot", root_helper)
+        self.assertIn("ResolveServedSnapshotRoot", root_helper)
         dll = (ROOT / "src/dllmain.cpp").read_text()
         self.assertIn("RegisterLoadMapPreCallback", dll)
         self.assertIn("RegisterInitGameStatePostCallback", dll)
@@ -179,15 +151,20 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertIn("if not socket then return true end", callback)
         self.assertLess(callback.index("if not socket then return true end"), callback.index("socket.gettime()"))
 
-    def test_recovered_root_selection_requires_authority_chain_and_fails_closed_on_ambiguity(self):
-        # Named failure this catches: (1) a readable but non-authoritative
-        # MotorTownGameState (orphan: the world's AuthorityGameMode is missing
-        # or its live GameState points elsewhere; or a world with no authority
-        # game mode at all) must never be served even when readable; (2) when
-        # two distinct candidates both pass the full authority chain (old and
-        # new world both readable mid-travel) selection must fail closed
-        # instead of picking an arbitrary positional "newest" UObjectArray
-        # entry, which would serve stale or fabricated state to HTTP clients.
+    def test_recovery_refuses_off_thread_unanchored_and_unreadable_chains(self):
+        # Named failures this catches: (1) removing the off-game-thread or
+        # no-anchor precondition must be observable in the scan itself: the
+        # FindAllOf stand-in records its invocations, and both refusals must
+        # happen BEFORE it is ever called (review-1 mutation: deleting the
+        # guard's return left the suite green because only source order was
+        # checked); (2) a fully authoritative chain (correct world, live
+        # backlink, current-world match) must still be refused when the
+        # candidate, its world, or its authority GameMode is PendingKill,
+        # unreachable or pending-destroyed - FindAllOf does not filter those
+        # states, so these readability gates are the only defense; (3) a
+        # readable old-world chain behind a current-world anchor is refused;
+        # (4) two candidates passing the chain on successive reads refuse as
+        # ambiguous instead of picking one.
         compiler = shutil.which("c++") or shutil.which("g++")
         if not compiler:
             self.skipTest("C++ compiler unavailable")
@@ -195,58 +172,126 @@ class SnapshotRegressionTests(unittest.TestCase):
             #include "src/active_snapshot_root.h"
             #include <cassert>
             #include <vector>
+            enum class Flag { None, PendingKill, Unreachable, BeginDestroyed };
             struct GameState;
-            struct GameMode { GameState* game_state; bool readable; };
-            struct World { GameMode* game_mode; bool readable; };
-            struct GameState { World* world; bool readable; };
+            struct GameMode { GameState* game_state; Flag flag = Flag::None; };
+            struct World { GameMode* game_mode; Flag flag = Flag::None; };
+            struct GameState { World* world; Flag flag = Flag::None; };
+            struct ScanSpy {
+                int invocations = 0;
+                std::vector<GameState*> objects;
+                std::vector<GameState*> operator()() { ++invocations; return objects; }
+            };
             int main() {
-                const auto readable = [](auto* object) { return object->readable; };
+                const auto readable = [](const auto* object) { return object && object->flag == Flag::None; };
                 const auto world_of = [](GameState* game_state) { return game_state->world; };
-                const auto authority_game_mode_of = [](World* world) { return world->game_mode; };
-                const auto game_state_of = [](GameMode* game_mode) { return game_mode->game_state; };
-                using Candidates = std::vector<GameState*>;
-                auto select = [&](Candidates candidates) {
-                    return SelectRecoveredSnapshotRoot(candidates, readable, world_of, authority_game_mode_of, game_state_of);
+                const auto mode_of = [](World* world) { return world->game_mode; };
+                const auto state_of = [](GameMode* game_mode) { return game_mode->game_state; };
+                const auto decide = [&](bool on_thread, const void* anchor, ScanSpy& spy) {
+                    // The scan is passed as a reference-capturing lambda so the
+                    // template cannot silently take the spy by value.
+                    return RecoverActiveSnapshotRoot<GameState>(on_thread, anchor, [&] { return spy(); }, readable, world_of, mode_of, state_of);
                 };
 
-                GameMode old_mode{nullptr, true};
-                World old_world{&old_mode, true};
-                GameState stale{&old_world, true};
-                old_mode.game_state = &stale;   // internally consistent pre-travel world
+                GameMode mode{nullptr};
+                World world{&mode};
+                GameState live{&world};
+                mode.game_state = &live;
 
-                GameMode fresh_mode{nullptr, true};
-                World fresh_world{&fresh_mode, true};
-                GameState live{&fresh_world, true};
-                fresh_mode.game_state = &live;  // authoritative current chain
-
-                GameState orphan{&fresh_world, true};   // readable but not the GameMode's live GameState
-                World client_world{nullptr, true};      // no AuthorityGameMode (no current-authority proof)
-                GameState mirrored{&client_world, true};
-                GameState destroyed{&fresh_world, false};  // pending destruction
-                GameState unanchored{nullptr, true};    // no world at all
-
-                // Empty scan (UObjectArray has no such class yet): fail closed.
-                assert(select(Candidates{}) == nullptr);
-                // The single authoritative candidate is admitted regardless of scan order.
-                assert(select(Candidates{&live}) == &live);
-                assert(select(Candidates{&destroyed, &orphan, &mirrored, &live}) == &live);
-                assert(select(Candidates{&live, &mirrored, &orphan, &destroyed}) == &live);
-                // Orphan: readable but not the GameMode's live GameState -> refused.
-                assert(select(Candidates{&orphan}) == nullptr);
-                // World without an AuthorityGameMode -> refused (no current-authority proof).
-                assert(select(Candidates{&mirrored}) == nullptr);
-                // Unreadable / unanchored candidates -> refused.
-                assert(select(Candidates{&destroyed}) == nullptr);
-                assert(select(Candidates{&unanchored}) == nullptr);
-                // Two fully-consistent readable chains (old + new world mid-travel):
-                // ambiguity must fail closed, never pick an arbitrary entry.
-                assert(select(Candidates{&stale, &live}) == nullptr);
-                assert(select(Candidates{&live, &stale}) == nullptr);
+                // Fully authoritative and current: admitted, scan ran exactly once.
+                {
+                    ScanSpy spy; spy.objects = {&live};
+                    const auto decision = decide(true, &world, spy);
+                    assert(decision.outcome == SnapshotRecoveryOutcome::Recovered);
+                    assert(decision.admitted == &live);
+                    assert(spy.invocations == 1);
+                }
+                // Off-game-thread: refused BEFORE the scan (spy stays at zero).
+                {
+                    ScanSpy spy; spy.objects = {&live};
+                    const auto decision = decide(false, &world, spy);
+                    assert(decision.outcome == SnapshotRecoveryOutcome::OffGameThread);
+                    assert(decision.admitted == nullptr);
+                    assert(spy.invocations == 0);
+                }
+                // No current-world identity (LoadMap anchor unavailable): refused BEFORE the scan.
+                {
+                    ScanSpy spy; spy.objects = {&live};
+                    const auto decision = decide(true, nullptr, spy);
+                    assert(decision.outcome == SnapshotRecoveryOutcome::NoCurrentWorld);
+                    assert(decision.admitted == nullptr);
+                    assert(spy.invocations == 0);
+                }
+                // A fully authoritative chain in a NON-current world is refused:
+                // membership in a world is not membership in the current world.
+                {
+                    GameMode old_mode{nullptr};
+                    World old_world{&old_mode};
+                    GameState stale{&old_world};
+                    old_mode.game_state = &stale;
+                    ScanSpy spy; spy.objects = {&stale};
+                    const auto decision = decide(true, &world, spy);
+                    assert(decision.outcome == SnapshotRecoveryOutcome::Unresolved);
+                    assert(decision.admitted == nullptr);
+                }
+                // Fully authoritative but PendingKill candidate: refused.
+                {
+                    GameState pending{&world, Flag::PendingKill};
+                    ScanSpy spy; spy.objects = {&pending};
+                    assert(decide(true, &world, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                }
+                // PendingKill world on an otherwise complete chain: refused.
+                {
+                    GameMode anchored_mode{nullptr};
+                    World dying_world{&anchored_mode, Flag::PendingKill};
+                    GameState anchored{&dying_world};
+                    anchored_mode.game_state = &anchored;
+                    ScanSpy spy; spy.objects = {&anchored};
+                    assert(decide(true, &dying_world, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                }
+                // PendingKill authority GameMode: refused.
+                {
+                    GameMode dying_mode{nullptr, Flag::PendingKill};
+                    World modeless{&dying_mode};
+                    GameState anchored{&modeless};
+                    dying_mode.game_state = &anchored;
+                    ScanSpy spy; spy.objects = {&anchored};
+                    assert(decide(true, &modeless, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                }
+                // Unreachable / pending-destroyed candidates: refused.
+                {
+                    GameState gone{&world, Flag::Unreachable};
+                    ScanSpy spy; spy.objects = {&gone};
+                    assert(decide(true, &world, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                }
+                {
+                    GameState dying{&world, Flag::BeginDestroyed};
+                    ScanSpy spy; spy.objects = {&dying};
+                    assert(decide(true, &world, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                }
+                // Orphan: readable, current world, but not the GameMode's live GameState.
+                {
+                    GameState orphan{&world};
+                    ScanSpy spy; spy.objects = {&orphan};
+                    assert(decide(true, &world, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                }
+                // Two candidates that each pass the chain on successive backlink
+                // reads (models the authority property being re-pointed while the
+                // scan runs): ambiguous, never guess.
+                {
+                    GameState second{&world};
+                    GameState* flipping = &live;
+                    const auto racing_state_of = [&](GameMode*) { GameState* seen = flipping; flipping = (flipping == &live) ? &second : &live; return seen; };
+                    ScanSpy spy; spy.objects = {&live, &second};
+                    const auto decision = RecoverActiveSnapshotRoot<GameState>(true, &world, spy, readable, world_of, mode_of, racing_state_of);
+                    assert(decision.outcome == SnapshotRecoveryOutcome::Ambiguous);
+                    assert(decision.admitted == nullptr);
+                }
             }
         """)
         with tempfile.TemporaryDirectory() as directory:
-            source_path = Path(directory) / "recovered.cpp"
-            binary_path = Path(directory) / "recovered"
+            source_path = Path(directory) / "recovery.cpp"
+            binary_path = Path(directory) / "recovery"
             source_path.write_text(source)
             subprocess.run(
                 [compiler, "-std=c++17", "-I", str(ROOT), str(source_path), "-o", str(binary_path)],
@@ -254,46 +299,166 @@ class SnapshotRegressionTests(unittest.TestCase):
             )
             subprocess.run([str(binary_path)], check=True)
 
+    def test_served_root_requires_current_world_live_backlink_and_weak_resolution(self):
+        # Named failures this catches: (1) cache reuse bound only to weak-world
+        # equality keeps serving a pair after the engine's current world moved
+        # on (review-1: recover/cache old root, second authoritative world
+        # appears, cache still returns the old root); (2) a cached root whose
+        # authority backlink changed is still served unless the backlink is
+        # re-read at serve time; (3) an unreadable (PendingKill/unreachable)
+        # root, world or GameMode must refuse even when the pointer identity
+        # still matches; (4) dead weak pointers refuse.
+        compiler = shutil.which("c++") or shutil.which("g++")
+        if not compiler:
+            self.skipTest("C++ compiler unavailable")
+        source = textwrap.dedent(r"""
+            #include "src/active_snapshot_root.h"
+            #include <cassert>
+            enum class Flag { None, PendingKill, Unreachable };
+            struct GameState;
+            struct GameMode { GameState* game_state; Flag flag = Flag::None; };
+            struct World { GameMode* game_mode; Flag flag = Flag::None; };
+            struct GameState { World* world; Flag flag = Flag::None; World* GetWorld() const { return world; } };
+            // Models the pinned FWeakObjectPtr::Get(): rejects destroyed and
+            // PendingKill referents, tolerates unreachable ones.
+            template <typename T>
+            struct Weak {
+                const T* value{};
+                const T* Get() const { return (value && value->flag != Flag::PendingKill) ? value : nullptr; }
+            };
+            int main() {
+                const auto readable = [](const auto* object) { return object && object->flag == Flag::None; };
+                const auto mode_of = [](const World* world) { return world->game_mode; };
+                const auto state_of = [](const GameMode* game_mode) { return game_mode->game_state; };
+                const auto serve = [&](const Weak<GameState>& root, const Weak<World>& world, const void* anchor) {
+                    return ResolveServedSnapshotRoot(root, world, anchor, readable, mode_of, state_of);
+                };
+
+                GameMode mode{nullptr};
+                World world{&mode};
+                GameState live{&world};
+                mode.game_state = &live;
+
+                Weak<GameState> live_weak{&live};
+                Weak<World> world_weak{&world};
+
+                // Healthy pair anchored to the current world: served.
+                assert(serve(live_weak, world_weak, &world) == &live);
+                // Cache reuse without an anchor refuses (identity unavailable).
+                assert(serve(live_weak, world_weak, nullptr) == nullptr);
+                // The current world moved on (second world became current):
+                // the cached pair refuses even though its own chain is intact.
+                {
+                    GameMode new_mode{nullptr};
+                    World new_world{&new_mode};
+                    GameState second{&new_world};
+                    new_mode.game_state = &second;
+                    assert(serve(live_weak, world_weak, &new_world) == nullptr);
+                    Weak<GameState> second_weak{&second};
+                    Weak<World> new_world_weak{&new_world};
+                    assert(serve(second_weak, new_world_weak, &new_world) == &second);
+                }
+                // Authority backlink changed after caching: refuse.
+                {
+                    GameState other{&world};
+                    mode.game_state = &other;
+                    assert(serve(live_weak, world_weak, &world) == nullptr);
+                    mode.game_state = &live;
+                    assert(serve(live_weak, world_weak, &world) == &live);
+                }
+                // Authority GameMode unreadable at serve time: refuse.
+                {
+                    mode.flag = Flag::PendingKill;
+                    assert(serve(live_weak, world_weak, &world) == nullptr);
+                    mode.flag = Flag::None;
+                }
+                // Root or world gone (weak pointer unresolvable): refuse.
+                assert(serve(Weak<GameState>{}, world_weak, &world) == nullptr);
+                assert(serve(live_weak, Weak<World>{}, &world) == nullptr);
+                // PendingKill root: rejected by the weak resolution itself.
+                {
+                    GameState dying{&world, Flag::PendingKill};
+                    assert(serve(Weak<GameState>{&dying}, world_weak, &world) == nullptr);
+                }
+                // Unreachable world: weak-resolvable but not gameplay-readable: refuse.
+                {
+                    world.flag = Flag::Unreachable;
+                    assert(serve(live_weak, world_weak, &world) == nullptr);
+                    world.flag = Flag::None;
+                }
+                // Root/world pair mismatch: refuse.
+                {
+                    Weak<World> other_world_weak{&world};
+                    GameState alien{nullptr};
+                    assert(serve(Weak<GameState>{&alien}, other_world_weak, &world) == nullptr);
+                }
+            }
+        """)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "served.cpp"
+            binary_path = Path(directory) / "served"
+            source_path.write_text(source)
+            subprocess.run([compiler, "-std=c++17", "-I", str(ROOT), str(source_path), "-o", str(binary_path)], check=True)
+            subprocess.run([str(binary_path)], check=True)
+
     def test_snapshot_recovery_runs_only_on_authorized_game_thread(self):
         # Named failure this catches: the recovery path scans the global
         # UObjectArray (FindAllOf). If that scan can run from the HTTP worker
         # thread, it races the game thread's object mutations exactly like the
-        # Run-13 D2 defect class; the guard must come before any scan and
-        # refuse off-thread captures fail-closed.
+        # Run-13 D2 defect class. The behavioral bite (the guard prevents the
+        # scan, spy stays at zero) is compiled-tested in
+        # test_recovery_refuses_off_thread_unanchored_and_unreadable_chains;
+        # this check pins the production WIRING to that compiled logic: the
+        # whole resolution (cache gate included) sits behind the GameThread
+        # guard, and the FindAllOf call exists exactly once, inside the
+        # recovery decision's scan lambda.
         source = (ROOT / "src/snapshot.cpp").read_text()
-        recovery = source.split("auto recover_active_game_state", 1)[1].split("auto Store::begin", 1)[0]
-        self.assertIn("is_in_game_thread()", recovery)
-        self.assertLess(recovery.index("is_in_game_thread()"), recovery.index("FindAllOf"))
-        self.assertIn("FindAllOf", recovery)
+        resolve = source.split("auto Store::resolve_active_game_state", 1)[1].split("auto Store::push_value", 1)[0]
+        self.assertIn("LuaMod::is_in_game_thread()", resolve)
+        self.assertLess(resolve.index("LuaMod::is_in_game_thread()"), resolve.index("ResolveServedSnapshotRoot"))
+        self.assertEqual(source.count("UObjectGlobals::FindAllOf"), 1, "the UObjectArray scan must exist exactly once")
+        self.assertIn("FindAllOf", resolve)
+        self.assertLess(resolve.index("LuaMod::is_in_game_thread()"), resolve.index("FindAllOf"))
         # The only class scanned is the contract's native GameState class.
-        self.assertIn('STR("MotorTownGameState")', recovery)
+        self.assertIn('STR("MotorTownGameState")', resolve)
+        # The compiled decision is actually wired in (with the live thread flag).
+        self.assertIn("RecoverActiveSnapshotRoot<UObject>", resolve)
 
     def test_snapshot_recovery_preserves_fail_closed_contract(self):
         # Named failure this catches: recovery must cache only through the
-        # Store's world-identity-checked registration and must still refuse
-        # with the typed 503 error when nothing resolvable exists. Removing
-        # either would return fabricated or partial data instead of failing
-        # closed.
+        # Store's weak-pointer registration and must still refuse with the
+        # typed 503 error when nothing resolvable exists. The served candidate
+        # must pass through the same weak-cache gate as the cache path (never
+        # a raw pointer that escapes weak resolution), the serve gate must
+        # re-read the authority backlink, and the current-world anchor must be
+        # wired from the LoadMap post callback.
         source = (ROOT / "src/snapshot.cpp").read_text()
         self.assertIn('"active MotorTownGameState is unavailable"', source)
-        recovery = source.split("auto recover_active_game_state", 1)[1].split("auto Store::begin", 1)[0]
-        self.assertIn("Store::set_active_game_state(", recovery)
-        self.assertNotIn("s_active_game_state =", recovery)
-        # Pinned C++ completeness contract: the recovery chain feeds the
-        # UWorld* returned by UObject::GetWorld() to code that needs the
-        # complete type (readability gate, AuthorityGameMode reflection,
-        # GetName). The pinned overlay only forward-declares UWorld, so the
-        # explicit <Unreal/World.hpp> include is required for the MSVC build.
-        self.assertIn("#include <Unreal/World.hpp>", source)
-        # Recovery admits a candidate only through the authority-chain selector.
-        self.assertIn("SelectRecoveredSnapshotRoot", recovery)
-        self.assertIn('STR("AuthorityGameMode")', recovery)
         resolve = source.split("auto Store::resolve_active_game_state", 1)[1].split("auto Store::push_value", 1)[0]
-        self.assertIn("ResolveActiveSnapshotRoot", resolve)
-        self.assertIn("recover_active_game_state()", resolve)
-        # The cached-root fast path must stay first: recovery runs only when
-        # the cache is missing or stale (failure path), never per request.
-        self.assertLess(resolve.index("ResolveActiveSnapshotRoot"), resolve.index("recover_active_game_state()"))
+        self.assertIn("Store::set_active_game_state(", resolve)
+        self.assertNotIn("s_active_game_state =", resolve)
+        self.assertEqual(source.count("serve_cached()"), 2, "cache gate before recovery and again before serving a recovered root")
+        # Serve-time backlink revalidation: the gate re-reads the authority
+        # chain through reflection instead of trusting registration time.
+        self.assertIn("ResolveServedSnapshotRoot", resolve)
+        self.assertIn('STR("AuthorityGameMode")', resolve)
+        self.assertIn('STR("GameState")', resolve)
+        self.assertIn("resolve_current_world()", resolve)
+        # Pinned C++ completeness contract: recovery feeds the UWorld* returned
+        # by UObject::GetWorld() to code that needs the complete type (the
+        # UObject* upcast into set_active_game_state, GetName). The pinned
+        # overlay only forward-declares UWorld, so the explicit
+        # <Unreal/World.hpp> include is required for the MSVC build.
+        self.assertIn("#include <Unreal/World.hpp>", source)
+        # PendingKill gameplay-validity gate on every reflection read.
+        readable_body = source.split("auto object_is_readable", 1)[1].split("auto read_object_property", 1)[0]
+        self.assertIn("HasAnyInternalFlags(EInternalObjectFlags::PendingKill)", readable_body)
+        # Current-world anchor wiring in dllmain: the engine hands over its own
+        # current world only inside the LoadMap post callback.
+        dll = (ROOT / "src/dllmain.cpp").read_text()
+        self.assertIn("RegisterLoadMapPostCallback", dll)
+        self.assertIn("GetThisCurrentWorld()", dll)
+        self.assertIn("Store::set_current_world(", dll)
 
     def test_lifecycle_diagnostics_survive_canary_log_level(self):
         # Named failure this catches: (1) [SnapshotDiag] lines emitted with
@@ -343,9 +508,14 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertIn("#include <Unreal/UnrealInitializer.hpp>", dll)
         # Callback registration is observable.
         self.assertIn("LoadMapPreCallbacks", dll)
+        self.assertIn("LoadMapPostCallbacks", dll)
         self.assertIn("InitGameStatePreCallbacks", dll)
         self.assertIn("InitGameStatePostCallbacks", dll)
         self.assertIn("InitGameStateDetour", dll)
+        # The boot line reports both LoadMap callback vector sizes, so the
+        # runtime probe can distinguish 'post callback registered' from
+        # 'detour never installed' (the current-world anchor source).
+        self.assertGreaterEqual(status.count("post_callbacks"), 2)
         snapshot = (ROOT / "src/snapshot.cpp").read_text()
         self.assertNotIn('ModStatics::LogOutput(L"[SnapshotDiag]', snapshot)
         require_explicit_diag_levels("snapshot.cpp", snapshot)

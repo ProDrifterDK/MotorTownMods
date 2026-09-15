@@ -37,6 +37,7 @@ namespace MotorTown::Snapshot
     uint64_t Store::s_next_id{1};
     FWeakObjectPtr Store::s_active_game_state{};
     FWeakObjectPtr Store::s_active_world{};
+    FWeakObjectPtr Store::s_current_world{};
 
     namespace
     {
@@ -102,7 +103,14 @@ namespace MotorTown::Snapshot
 
         auto object_is_readable(UObject* object) -> bool
         {
+            // Gameplay-validity per the pinned engine's own internal-flag rule
+            // (UnrealFlags.hpp: PendingKill = "invalid for gameplay but valid
+            // objects"). FindAllOf does not remove PendingKill objects and only
+            // FWeakObjectPtr::Get rejects them, so every object this module
+            // touches (chain candidates, worlds, authority GameModes, array
+            // elements) is gated on the flag here, before any reflection read.
             return object && !object->IsUnreachable() &&
+                   !object->HasAnyInternalFlags(EInternalObjectFlags::PendingKill) &&
                    !object->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed));
         }
 
@@ -134,48 +142,6 @@ namespace MotorTown::Snapshot
                 last_emitted[key] = now;
             }
             ModStatics::LogOutput<LogLevel::Normal>(L"[SnapshotDiag] {}", message);
-        }
-
-        auto recover_active_game_state() -> UObject*
-        {
-            // resolve_active_game_state is reached only from capture_query,
-            // which runs inside the authorized GameThread capture binding.
-            // The UObjectArray scan below must never cross threads: refuse
-            // every other context fail-closed (Run-13 D2 defect class).
-            if (!LuaMod::is_in_game_thread())
-            {
-                log_snapshot_diag_throttled(L"off-thread", L"active root recovery refused: not on the GameThread");
-                return nullptr;
-            }
-            std::vector<UObject*> candidates;
-            Unreal::UObjectGlobals::FindAllOf(STR("MotorTownGameState"), candidates);
-            // Authoritative identity proof per candidate: candidate -> its
-            // world -> the world's current AuthorityGameMode -> that GameMode's
-            // live GameState must be the exact candidate. Any other readable
-            // MotorTownGameState (old world mid-GC, orphaned instance) is
-            // refused, and two simultaneously valid roots fail closed instead
-            // of guessing. This is what makes the cached identity check below
-            // non-tautological: the cached (game_state, world) pair was proven
-            // authoritative, not merely self-consistent.
-            auto* recovered = SelectRecoveredSnapshotRoot(
-                candidates,
-                [](UObject* object) { return object_is_readable(object); },
-                [](UObject* object) { return object->GetWorld(); },
-                [](UObject* world) { return read_object_property(world, STR("AuthorityGameMode")); },
-                [](UObject* game_mode) { return read_object_property(game_mode, STR("GameState")); });
-            if (recovered)
-            {
-                auto* world = recovered->GetWorld();
-                Store::set_active_game_state(recovered, world);
-                log_snapshot_diag_throttled(L"recovered",
-                    std::wstring{L"active root recovered on demand (game_state="} + recovered->GetName() +
-                    L" world=" + world->GetName() + L")");
-                return recovered;
-            }
-            log_snapshot_diag_throttled(L"unresolved",
-                std::wstring{L"active root recovery failed: no single authoritative MotorTownGameState (world AuthorityGameMode -> GameState chain, candidates="} +
-                std::to_wstring(candidates.size()) + L")");
-            return nullptr;
         }
 
         auto object_reference(UObject* object, Budget& budget) -> Value
@@ -662,19 +628,106 @@ namespace MotorTown::Snapshot
         s_active_world = nullptr;
     }
 
+    auto Store::set_current_world(UObject* world) -> void
+    {
+        std::lock_guard guard{s_mutex};
+        s_current_world = world;
+    }
+
+    auto Store::resolve_current_world() -> UObject*
+    {
+        std::lock_guard guard{s_mutex};
+        // FWeakObjectPtr::Get rejects destroyed and PendingKill referents, so
+        // an engine-current world that since died refuses here instead of
+        // serving as a stale identity anchor.
+        return s_current_world.Get();
+    }
+
     auto Store::resolve_active_game_state() -> UObject*
     {
+        // The capture binding only reaches here on the authorized GameThread;
+        // refuse any other caller before touching engine state (Run-13 D2
+        // defect class). This also covers the cached fast path: weak-pointer
+        // resolution and reflection reads are game-thread state too.
+        if (!LuaMod::is_in_game_thread())
         {
-            std::lock_guard guard{s_mutex};
-            if (auto* cached = ResolveActiveSnapshotRoot(s_active_game_state, s_active_world))
-            {
-                return cached;
-            }
+            log_snapshot_diag_throttled(L"off-thread", L"active root resolution refused: not on the GameThread");
+            return nullptr;
         }
-        // Cached root missing or stale (the InitGameState lifecycle hook never
-        // fired on this boot, or the world traveled): resolve the current game
-        // state on demand on the GameThread instead of failing closed forever.
-        return recover_active_game_state();
+
+        // Engine-established current-world identity: without it no root can be
+        // proven current, so neither the cache nor recovery may serve. The
+        // anchor is captured inside the pinned overlay's LoadMap post callback
+        // (dllmain.cpp) as a weak pointer; if the LoadMap hook is disabled, the
+        // detour never installed, or the recorded world is gone, everything
+        // below refuses fail-closed instead of serving a guess.
+        UObject* current_world = resolve_current_world();
+        const void* current_world_identity = static_cast<const void*>(current_world);
+        const auto read_authority_mode = [](UObject* world) { return read_object_property(world, STR("AuthorityGameMode")); };
+        const auto read_mode_game_state = [](UObject* game_mode) { return read_object_property(game_mode, STR("GameState")); };
+        const auto serve_cached = [&]() -> UObject* {
+            std::lock_guard guard{s_mutex};
+            return ResolveServedSnapshotRoot(
+                s_active_game_state, s_active_world, current_world_identity,
+                [](UObject* object) { return object_is_readable(object); },
+                read_authority_mode,
+                read_mode_game_state);
+        };
+
+        // Cached fast path first: recovery is the failure path, never a
+        // per-request scan. The gate re-reads the authority backlink through
+        // reflection on every serve, so a pair whose world lost its authority
+        // (or whose GameMode re-pointed its GameState) is refused here.
+        if (auto* cached = serve_cached()) return cached;
+
+        if (!current_world)
+        {
+            log_snapshot_diag_throttled(L"no-current-world",
+                L"active root unavailable: no current-world identity (LoadMap hook inactive or anchor unresolved)");
+            return nullptr;
+        }
+
+        const auto decision = RecoverActiveSnapshotRoot<UObject>(
+            true, current_world_identity,
+            [&]() {
+                std::vector<UObject*> found;
+                Unreal::UObjectGlobals::FindAllOf(STR("MotorTownGameState"), found);
+                return found;
+            },
+            [](UObject* object) { return object_is_readable(object); },
+            [](UObject* object) { return object->GetWorld(); },
+            read_authority_mode,
+            read_mode_game_state);
+
+        switch (decision.outcome)
+        {
+            case SnapshotRecoveryOutcome::Unresolved:
+                log_snapshot_diag_throttled(L"unresolved",
+                    L"active root recovery failed: no candidate passed the current-world authority chain");
+                return nullptr;
+            case SnapshotRecoveryOutcome::Ambiguous:
+                log_snapshot_diag_throttled(L"ambiguous",
+                    L"active root recovery failed: multiple chain-admissible roots; refusing instead of guessing");
+                return nullptr;
+            case SnapshotRecoveryOutcome::OffGameThread:
+            case SnapshotRecoveryOutcome::NoCurrentWorld:
+                // Unreachable: both preconditions were checked above and the
+                // pure decision refuses before scanning without them.
+                return nullptr;
+            case SnapshotRecoveryOutcome::Recovered:
+                break;
+        }
+
+        auto* world = decision.admitted->GetWorld();
+        Store::set_active_game_state(decision.admitted, world);
+        log_snapshot_diag_throttled(L"recovered",
+            std::wstring{L"active root recovered on demand (game_state="} + decision.admitted->GetName() +
+            L" world=" + world->GetName() + L")");
+        // Never return a pointer the stored weak root/world cannot resolve:
+        // the recovered candidate is served through the exact same weak-cache
+        // gate as every other path, and a late GC/PendingKill race refuses.
+        if (auto* served = serve_cached()) return served;
+        return nullptr;
     }
 
     auto Store::push_value(const LuaMadeSimple::Lua& lua, const Value& value) -> void

@@ -83,6 +83,11 @@ namespace MotorTown::Snapshot
         static auto cancel_all() -> void;
         static auto set_active_game_state(RC::Unreal::UObject* game_state, RC::Unreal::UObject* world) -> void;
         static auto clear_active_game_state() -> void;
+        // Engine-established current-world identity, captured inside the
+        // pinned overlay's LoadMap post callback (see dllmain.cpp). A null or
+        // unresolvable anchor refuses every serve and recovery attempt.
+        static auto set_current_world(RC::Unreal::UObject* world) -> void;
+        static auto resolve_current_world() -> RC::Unreal::UObject*;
         static auto resolve_active_game_state() -> RC::Unreal::UObject*;
         static auto push_value(const RC::LuaMadeSimple::Lua& lua, const Value& value) -> void;
 
@@ -99,5 +104,6 @@ namespace MotorTown::Snapshot
         static uint64_t s_next_id;
         static RC::Unreal::FWeakObjectPtr s_active_game_state;
         static RC::Unreal::FWeakObjectPtr s_active_world;
+        static RC::Unreal::FWeakObjectPtr s_current_world;
     };
 }

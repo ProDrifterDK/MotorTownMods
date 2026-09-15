@@ -12,8 +12,11 @@
 #include <Unreal/UFunction.hpp>
 #include <Unreal/UScriptStruct.hpp>
 #include <Unreal/UnrealInitializer.hpp>
+#include <Unreal/World.hpp>
 #include <Unreal/Property/FObjectProperty.hpp>
 #include <Unreal/Property/FStrProperty.hpp>
+
+#include <exception>
 
 #include "webserver.h"
 #include "statics.h"
@@ -205,6 +208,30 @@ auto MotorTownMods::on_unreal_init() -> void
 			MotorTown::Snapshot::Store::clear_active_game_state();
 			return {false, false};
 		});
+	// B1104 correction: engine-established current-world identity, captured at
+	// the only pinned moment it is handed to the mod. RegisterLoadMapPostCallback
+	// fires after UEngine::LoadMap returns, so FWorldContext::GetThisCurrentWorld()
+	// is the engine's own record of the world it just made current. Stored as a
+	// weak pointer and required by every snapshot serve/recovery path: when the
+	// LoadMap hook is disabled (bHookLoadMap=false silently skips detour
+	// installation) or the recorded world dies, the anchor is null/unresolvable
+	// and every endpoint refuses fail-closed instead of serving stale state.
+	// GetThisCurrentWorld() throws when the pinned engine version has no offset
+	// for it; that degrades to a null anchor, never to a guessed one.
+	Unreal::Hook::RegisterLoadMapPostCallback(
+		[](Unreal::UEngine*, Unreal::FWorldContext& world_context, Unreal::FURL, Unreal::UPendingNetGame*, Unreal::FString&) -> std::pair<bool, bool> {
+			Unreal::UWorld* current_world = nullptr;
+			try
+			{
+				current_world = world_context.GetThisCurrentWorld();
+			}
+			catch (const std::exception&)
+			{
+				current_world = nullptr;
+			}
+			MotorTown::Snapshot::Store::set_current_world(current_world);
+			return {false, false};
+		});
 	Unreal::Hook::RegisterInitGameStatePostCallback([](Unreal::AGameModeBase* context) {
 		MotorTown::Snapshot::Store::clear_active_game_state();
 		// Run-17c RCA diagnostics: every early-return branch must be observable
@@ -269,6 +296,7 @@ auto MotorTownMods::on_unreal_init() -> void
 	const bool lifecycle_loadmap_hook_configured = Unreal::UnrealInitializer::StaticStorage::GlobalConfig.bHookLoadMap;
 	const bool lifecycle_loadmap_detour_object_present = Unreal::Hook::StaticStorage::LoadMapDetour != nullptr;
 	const size_t lifecycle_loadmap_pre_callbacks = Unreal::Hook::StaticStorage::LoadMapPreCallbacks.size();
+	const size_t lifecycle_loadmap_post_callbacks = Unreal::Hook::StaticStorage::LoadMapPostCallbacks.size();
 	const bool lifecycle_initgamestate_hook_configured = Unreal::UnrealInitializer::StaticStorage::GlobalConfig.bHookInitGameState;
 	const bool lifecycle_signature_ready = Unreal::AGameModeBase::InitGameStateInternal.is_ready();
 	const uint64_t lifecycle_signature_address = lifecycle_signature_ready ? reinterpret_cast<uint64_t>(Unreal::AGameModeBase::InitGameStateInternal.get_function_address()) : 0;
@@ -276,10 +304,11 @@ auto MotorTownMods::on_unreal_init() -> void
 	const size_t lifecycle_initgamestate_pre_callbacks = Unreal::Hook::StaticStorage::InitGameStatePreCallbacks.size();
 	const size_t lifecycle_initgamestate_post_callbacks = Unreal::Hook::StaticStorage::InitGameStatePostCallbacks.size();
 	ModStatics::LogOutput<LogLevel::Warning>(
-		L"[SnapshotDiag] lifecycle hook status: loadmap hook_configured={} detour_object_present={} pre_callbacks={} initgamestate hook_configured={} signature_ready={} signature_address={:#x} detour_object_present={} pre_callbacks={} post_callbacks={} (hook_configured=false or detour_object_present=false means the InitGameState callback can never fire; detour_object_present=true does not prove PolyHook install success, which the pinned public API does not expose)",
+		L"[SnapshotDiag] lifecycle hook status: loadmap hook_configured={} detour_object_present={} pre_callbacks={} post_callbacks={} initgamestate hook_configured={} signature_ready={} signature_address={:#x} detour_object_present={} pre_callbacks={} post_callbacks={} (hook_configured=false or detour_object_present=false means the InitGameState callback can never fire; detour_object_present=true does not prove PolyHook install success, which the pinned public API does not expose)",
 		lifecycle_loadmap_hook_configured,
 		lifecycle_loadmap_detour_object_present,
 		lifecycle_loadmap_pre_callbacks,
+		lifecycle_loadmap_post_callbacks,
 		lifecycle_initgamestate_hook_configured,
 		lifecycle_signature_ready,
 		lifecycle_signature_address,
