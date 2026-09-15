@@ -29,13 +29,13 @@ struct SnapshotRecoveryDecision
     SnapshotRecoveryOutcome outcome{};
 };
 
-// Recovery decision. current_world is the engine's own record of the world it
-// made current (FWorldContext::GetThisCurrentWorld, captured inside the pinned
-// overlay's LoadMap post callback and stored as a weak pointer). A world only
-// chain-admissible in an older world is refused by the current-world identity
-// comparison, which is what makes mid-travel/old-world chains fail closed
-// instead of serving stale state. The scan callable is invoked at most once
-// and only after both preconditions hold.
+// Recovery decision. current_world is the last engine current-world identity
+// delivered to this module (FWorldContext::GetThisCurrentWorld from the pinned
+// overlay's LoadMap post callback, stored as a weak pointer). The identity
+// check refuses a candidate from a different world, but it is only as current
+// as the notifications this module received: a competing registrar can veto
+// before this module's pre callback and leave an older anchor usable. The scan
+// callable is invoked at most once and only after both preconditions hold.
 template <typename Candidate, typename Scan, typename IsReadable, typename WorldOf, typename AuthorityGameModeOf, typename GameStateOf>
 auto RecoverActiveSnapshotRoot(bool on_game_thread, const void* current_world, Scan scan, IsReadable is_readable, WorldOf world_of, AuthorityGameModeOf authority_game_mode_of, GameStateOf game_state_of) -> SnapshotRecoveryDecision<Candidate>
 {
@@ -66,10 +66,11 @@ auto RecoverActiveSnapshotRoot(bool on_game_thread, const void* current_world, S
 // sample_lifecycle_state); tests construct and mutate it directly.
 struct SnapshotLifecycleState
 {
-    // Resolved engine-anchor identity (FWorldContext::GetThisCurrentWorld,
-    // captured inside the pinned overlay's LoadMap post callback). Null means
-    // no usable anchor: never delivered, invalidated and not yet refreshed, or
-    // the weak pointer no longer resolves.
+    // Resolved last-delivered engine-anchor identity
+    // (FWorldContext::GetThisCurrentWorld from the pinned overlay's LoadMap
+    // post callback). Null means no usable anchor: never delivered, invalidated
+    // and not yet refreshed, or the weak pointer no longer resolves. Non-null
+    // does not prove freshness when a competing registrar vetoed delivery.
     const void* current_world{};
     // Monotonic: advanced on every travel invalidation (LoadMap pre) and every
     // anchor refresh (LoadMap post). Any advance invalidates admissions
@@ -106,8 +107,10 @@ inline auto EvaluateResolutionPreconditions(bool on_game_thread, const SnapshotL
 // stored or returned only while the LIVE lifecycle state still matches the
 // sample field for field: the generation has not advanced (no invalidation or
 // refresh happened since sampling), no travel interval is open, and the
-// anchor is the same identity. Every field is load-bearing: any drift refuses
-// fail-closed, and the next request re-samples fresh state.
+// anchor is the same identity. Every field is load-bearing: any observed drift
+// refuses fail-closed, and the next request re-samples the latest state delivered
+// to this module. A veto before this module's LoadMap callback can leave every
+// field unchanged around a stale anchor.
 inline auto AdmissionStillValid(const SnapshotLifecycleState& sampled, const SnapshotLifecycleState& live) -> bool
 {
     return sampled.travel_generation == live.travel_generation &&
@@ -156,14 +159,16 @@ auto EvaluateRecoveredTail(Candidate* admitted, IsReadable is_readable, WorldOf 
 //      call, not a passive pointer comparison, so a pending-destroyed root
 //      is refused without being dereferenced into it),
 //   3. the resolved root's world is the cached world,
-//   4. the cached world IS the engine's current world (identity compared as
-//      const void* so an incomplete UWorld forward declaration compiles),
+//   4. the cached world IS the last LoadMap-delivered current-world anchor
+//      (identity compared as const void* so an incomplete UWorld forward
+//      declaration compiles),
 //   5. the freshly re-read authority GameMode is gameplay-readable, and
 //   6. that GameMode's live GameState still points back at the exact root,
 //      re-read through reflection at serve time rather than trusted from the
 //      moment of registration.
-// Anything else refuses: a stale, orphaned, ambiguous or dead root is never
-// served.
+// Anything failing these checks refuses. They do not prove engine freshness if
+// a competing registrar vetoes before this module's LoadMap notification: the
+// prior anchor and its internally consistent authority chain may still pass.
 template <typename WeakRoot, typename WeakWorld, typename IsReadable, typename AuthorityGameModeOf, typename GameStateOf>
 auto ResolveServedSnapshotRoot(const WeakRoot& root, const WeakWorld& world, const void* current_world, IsReadable is_readable, AuthorityGameModeOf authority_game_mode_of, GameStateOf game_state_of) -> decltype(root.Get())
 {

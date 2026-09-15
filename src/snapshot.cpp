@@ -652,8 +652,11 @@ namespace MotorTown::Snapshot
         // s_open_travels stays above zero: every snapshot endpoint keeps
         // refusing fail-closed with the typed 503 and the anchor-specific
         // diagnostic below. No dispatcher-side ordering or coverage guarantee
-        // exists or is claimed; providing one is a dispatcher-boundary change
-        // outside this module (recorded as a design gap in the lane report).
+        // exists. If a competing registrar vetoes before this pre callback,
+        // none of that invalidation happens and the prior anchor may remain
+        // usable after the engine changes worlds. Closing that residual gap is
+        // a dispatcher-boundary change outside this module (recorded as a
+        // design gap in the lane report).
         std::lock_guard guard{s_mutex};
         s_active_game_state = nullptr;
         s_active_world = nullptr;
@@ -765,14 +768,19 @@ namespace MotorTown::Snapshot
         const auto read_authority_mode = [](UObject* world) { return read_object_property(world, STR("AuthorityGameMode")); };
         const auto read_mode_game_state = [](UObject* game_mode) { return read_object_property(game_mode, STR("GameState")); };
 
-        // Cached fast path first: recovery is the failure path, never a
-        // per-request scan. The validity check and the weak gate run under ONE
-        // lock acquisition, so a concurrent travel writer cannot land between
-        // them; a sample overtaken by an invalidation or refresh (generation
-        // advanced) is never served here. The gate re-reads the authority
-        // backlink through reflection on every serve, so a pair whose world
-        // lost its authority (or whose GameMode re-pointed its GameState) is
-        // refused too.
+        // B1104 dedicated-server evidence makes recovery the operative root-
+        // population path: the registered InitGameState post callback delivered
+        // zero times, then the first snapshot request recovered and cached the
+        // live root. Later requests take this cached fast path, so recovery is
+        // not normally a per-request scan. The validity check and weak gate run
+        // under ONE lock acquisition, so a concurrent travel writer cannot land
+        // between them; a sample overtaken by a delivered invalidation or
+        // refresh (generation advanced) is never served here. The gate re-reads
+        // the authority backlink through reflection on every serve, so a pair
+        // whose world lost its authority (or whose GameMode re-pointed its
+        // GameState) is refused too. It cannot detect a newer world when a peer
+        // vetoes LoadMap delivery before this module; then the stale anchor may
+        // remain usable and satisfy the same internal chain.
         const auto serve_cached = [&]() -> UObject* {
             std::lock_guard guard{s_mutex};
             const auto live = sample_lifecycle_state();
@@ -788,8 +796,10 @@ namespace MotorTown::Snapshot
         // If the lifecycle state advanced after the entry sample (a travel
         // interval opened or completed between sampling and here), the sampled
         // anchor identity is stale: refuse this resolution instead of scanning
-        // against it. The next request re-samples fresh state; nothing stale
-        // is scanned, stored or returned.
+        // against it. The next request re-samples the latest lifecycle state
+        // delivered to this module. This blocks state changes the module saw;
+        // it cannot detect a LoadMap notification vetoed before this module,
+        // which can leave the prior anchor usable.
         bool lifecycle_advanced = false;
         {
             std::lock_guard guard{s_mutex};

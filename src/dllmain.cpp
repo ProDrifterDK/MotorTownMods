@@ -218,9 +218,12 @@ auto MotorTownMods::on_unreal_init() -> void
 	// answering the typed 503 with the anchor-specific diagnostic until a
 	// later delivered LoadMap refreshes the anchor (/status is unaffected and
 	// stays available). No dispatcher-side ordering, priority, or
-	// notification-coverage guarantee exists or is claimed; providing one
-	// would need a dispatcher-boundary mechanism outside the interruptible
-	// peer lists and is recorded as a design gap in the lane report.
+	// notification-coverage guarantee exists. If a competing registrar vetoes
+	// delivery before this mod's pre callback, neither invalidation nor the
+	// later anchor refresh reaches this module; the prior anchor may remain
+	// usable even after the engine changes worlds. Closing that residual gap
+	// needs a dispatcher-boundary mechanism outside the interruptible peer
+	// lists and is recorded as a design gap in the lane report.
 	Unreal::Hook::RegisterLoadMapPreCallback(
 		[](Unreal::UEngine*, Unreal::FWorldContext&, Unreal::FURL, Unreal::UPendingNetGame*, Unreal::FString&) -> std::pair<bool, bool> {
 			// Travel invalidation, delivered-only: when THIS callback runs, the
@@ -237,18 +240,20 @@ auto MotorTownMods::on_unreal_init() -> void
 			MotorTown::Snapshot::Store::invalidate_travel_state();
 			return {false, false};
 		});
-	// B1104 correction: engine-established current-world identity, captured
-	// at the only pinned moment it is handed to the mod.
+	// B1104 correction: the last delivered engine-established current-world
+	// identity, captured at the only pinned moment it is handed to the mod.
 	// RegisterLoadMapPostCallback fires after UEngine::LoadMap returns, so
-	// FWorldContext::GetThisCurrentWorld() is the engine's own record of the
-	// world it just made current. Stored as a weak pointer and required by
-	// every snapshot serve/recovery path: when the LoadMap hook is disabled
-	// (bHookLoadMap=false silently skips detour installation), the post
-	// callback is never delivered to this mod, or the recorded world dies,
-	// the anchor is null/unresolvable and every snapshot endpoint refuses
-	// fail-closed instead of serving stale state. GetThisCurrentWorld()
-	// throws when the pinned engine version has no offset for it; that
-	// degrades to a null anchor, never to a guessed one. The refresh closes
+	// FWorldContext::GetThisCurrentWorld() records the world made current by
+	// that delivered LoadMap. Stored as a weak pointer and required by every
+	// snapshot serve/recovery path: before any anchor has been delivered, when
+	// the LoadMap hook is disabled (bHookLoadMap=false silently skips detour
+	// installation), after a delivered pre lacks a delivered post, or when the
+	// recorded world dies, the anchor is null/unresolvable and the endpoints
+	// refuse fail-closed. This is not an independent freshness oracle: a peer
+	// that vetoes before this mod's pre callback can leave the prior anchor
+	// usable after a world change. GetThisCurrentWorld() throws when the pinned
+	// engine version has no offset for it; that degrades a delivered refresh to
+	// a null anchor, never to a guessed one. The refresh closes
 	// exactly one open travel interval (Store bookkeeping), so a nested
 	// inner LoadMap's post cannot restore serve authority while an
 	// enclosing travel is still open.
@@ -266,6 +271,10 @@ auto MotorTownMods::on_unreal_init() -> void
 			MotorTown::Snapshot::Store::set_current_world(current_world);
 			return {false, false};
 		});
+	// Measured B1104 dedicated-server boot behavior: this post callback was
+	// registered, but it delivered zero times across the complete run. It does
+	// not populate the active root there; the first snapshot request's on-demand
+	// recovery is the operative population path.
 	Unreal::Hook::RegisterInitGameStatePostCallback([](Unreal::AGameModeBase* context) {
 		MotorTown::Snapshot::Store::clear_active_game_state();
 		// Run-17c RCA diagnostics: every early-return branch must be observable
@@ -309,27 +318,26 @@ auto MotorTownMods::on_unreal_init() -> void
 			world->GetName());
 	});
 
-	// B1104 dedicated 503 RCA discriminator: one-shot boot evidence for the
-	// lifecycle-hook preconditions that decide whether the InitGameState
-	// callback can ever fire. In the pinned overlay (0a7434d / deps/first/
-	// Unreal 121f2ff) Register*Callback only attempts the hook when
-	// GlobalConfig.bHook* is set, and HookInitGameState()/HookLoadMap() assign
-	// the detour object BEFORE calling PLH::hook() and discard hook()'s
-	// result. Each field therefore proves exactly one thing:
+	// B1104 dedicated 503 RCA discriminator: one-shot registration-side
+	// evidence for the lifecycle hooks. The measured run reported both hooks
+	// configured, the InitGameState signature resolved, both detour objects
+	// present, and this post callback registered, yet emitted zero InitGameState
+	// post lines across the complete dedicated-server boot. The game did not
+	// invoke this callback in that boot; on-demand recovery populated the root.
+	// In the pinned overlay (0a7434d / deps/first/Unreal 121f2ff), each field
+	// below proves exactly one thing:
 	//   hook_configured      = the UE4SS setting that gates the hook attempt.
 	//   signature_ready/address = whether the engine function was resolved.
 	//   detour_object_present = a detour object was allocated/configured.
 	//   pre_callbacks/post_callbacks = the callback is registered in the
 	//     pinned dispatcher vector (present even when hooking is disabled).
-	// None of these fields proves that PolyHook installed the detour, that the
-	// original function is reachable, that the callback was delivered, or why
-	// no '[SnapshotDiag] InitGameState post:' line follows. Install state is
-	// not read here: the polyhook_2 dependency is pinned at
-	// fd2a88f09c8ae89440858fc52573656141013c7f (deps/third-repo/packages/p/
-	// polyhook_2/CMakeLists.txt) but its checkout is not materialized locally,
-	// so no install-state query was verified against the exact pinned headers
-	// and none is used. Pinned to LogLevel::Warning so it survives
-	// MOD_SERVER_LOG_LEVEL=2.
+	// The fields alone do not prove that PolyHook installed the detour or that
+	// a callback was delivered. This diagnostic does not query hook state, so
+	// install success remains unreported. The zero post-line result above comes
+	// from the complete runtime log, not from inferring delivery from these
+	// fields. This status is pinned to LogLevel::Warning so it survives
+	// MOD_SERVER_LOG_LEVEL=2. The same measured log retained the on-demand
+	// recovery diagnostic while suppressing default-level startup output.
 	const bool lifecycle_loadmap_hook_configured = Unreal::UnrealInitializer::StaticStorage::GlobalConfig.bHookLoadMap;
 	const bool lifecycle_loadmap_detour_object_present = Unreal::Hook::StaticStorage::LoadMapDetour != nullptr;
 	const size_t lifecycle_loadmap_pre_callbacks = Unreal::Hook::StaticStorage::LoadMapPreCallbacks.size();
