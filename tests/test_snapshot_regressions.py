@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -278,6 +279,12 @@ class SnapshotRegressionTests(unittest.TestCase):
         recovery = source.split("auto recover_active_game_state", 1)[1].split("auto Store::begin", 1)[0]
         self.assertIn("Store::set_active_game_state(", recovery)
         self.assertNotIn("s_active_game_state =", recovery)
+        # Pinned C++ completeness contract: the recovery chain feeds the
+        # UWorld* returned by UObject::GetWorld() to code that needs the
+        # complete type (readability gate, AuthorityGameMode reflection,
+        # GetName). The pinned overlay only forward-declares UWorld, so the
+        # explicit <Unreal/World.hpp> include is required for the MSVC build.
+        self.assertIn("#include <Unreal/World.hpp>", source)
         # Recovery admits a candidate only through the authority-chain selector.
         self.assertIn("SelectRecoveredSnapshotRoot", recovery)
         self.assertIn('STR("AuthorityGameMode")', recovery)
@@ -301,13 +308,27 @@ class SnapshotRegressionTests(unittest.TestCase):
         # carry the registration-decision inputs (hook configuration flags,
         # resolved signature, callback counts) so 'never attempted' and
         # 'attempted but never fired' are distinguishable.
+        # (3) The one-shot lifecycle status call spans multiple lines, so a
+        # line-based check never inspects the line carrying LogOutput and its
+        # template argument together; a per-call-site regex is required to
+        # catch a silent revert to Default there.
+        snapshot_diag_call = re.compile(
+            r"ModStatics::LogOutput\s*(?:<(?P<level>[^>]*)>)?\s*\(\s*L?\"(?P<text>[^\"]*)"
+        )
+
+        def require_explicit_diag_levels(source_name, source_text):
+            for match in snapshot_diag_call.finditer(source_text):
+                if not match.group("text").startswith("[SnapshotDiag]"):
+                    continue
+                level = match.group("level") or ""
+                self.assertTrue(
+                    "LogLevel::Normal" in level or "LogLevel::Warning" in level,
+                    f"{source_name}: [SnapshotDiag] LogOutput lacks explicit level <= Normal: {match.group(0)[:120]!r}",
+                )
+
         dll = (ROOT / "src/dllmain.cpp").read_text()
         self.assertNotIn('ModStatics::LogOutput(L"[SnapshotDiag]', dll)
-        for line in [segment for segment in dll.splitlines() if "[SnapshotDiag]" in segment and "LogOutput" in segment]:
-            self.assertTrue(
-                "LogOutput<LogLevel::Normal>" in line or "LogOutput<LogLevel::Warning>" in line,
-                f"SnapshotDiag line lacks explicit level <= Normal: {line.strip()}",
-            )
+        require_explicit_diag_levels("dllmain.cpp", dll)
         status = dll.split("[SnapshotDiag] lifecycle hook status", 1)[1]
         self.assertIn("signature_ready", status)
         self.assertIn("signature_address", status)
@@ -327,11 +348,7 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertIn("InitGameStateDetour", dll)
         snapshot = (ROOT / "src/snapshot.cpp").read_text()
         self.assertNotIn('ModStatics::LogOutput(L"[SnapshotDiag]', snapshot)
-        for line in [segment for segment in snapshot.splitlines() if "[SnapshotDiag]" in segment and "LogOutput" in segment]:
-            self.assertTrue(
-                "LogOutput<LogLevel::Normal>" in line or "LogOutput<LogLevel::Warning>" in line,
-                f"SnapshotDiag line lacks explicit level <= Normal: {line.strip()}",
-            )
+        require_explicit_diag_levels("snapshot.cpp", snapshot)
 
     def test_b1104_contract_is_distinct_and_runtime_pending(self):
         b1088 = json.loads((ROOT / "compatibility/motortown-0.7.19-b1088.json").read_text())
