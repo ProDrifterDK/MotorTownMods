@@ -3,6 +3,7 @@
 
 #include <Mod/LuaMod.hpp>
 #include <Unreal/UObjectGlobals.hpp>
+#include <Unreal/World.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -105,6 +106,17 @@ namespace MotorTown::Snapshot
                    !object->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed));
         }
 
+        auto read_object_property(UObject* object, const wchar_t* property_name) -> UObject*
+        {
+            // Same reflection read as the InitGameState registration path in
+            // dllmain.cpp: a missing or non-object property yields nullptr so
+            // the caller's authority chain fails closed.
+            auto* property = object->GetPropertyByNameInChain(property_name);
+            if (!property || !property->IsA<FObjectProperty>()) return nullptr;
+            return static_cast<FObjectProperty*>(property)->GetObjectPropertyValue(
+                property->ContainerPtrToValuePtr<void>(object));
+        }
+
         auto log_snapshot_diag_throttled(std::wstring key, std::wstring message) -> void
         {
             // Failure-path diagnostics only: repeats are throttled so a polled
@@ -137,10 +149,20 @@ namespace MotorTown::Snapshot
             }
             std::vector<UObject*> candidates;
             Unreal::UObjectGlobals::FindAllOf(STR("MotorTownGameState"), candidates);
+            // Authoritative identity proof per candidate: candidate -> its
+            // world -> the world's current AuthorityGameMode -> that GameMode's
+            // live GameState must be the exact candidate. Any other readable
+            // MotorTownGameState (old world mid-GC, orphaned instance) is
+            // refused, and two simultaneously valid roots fail closed instead
+            // of guessing. This is what makes the cached identity check below
+            // non-tautological: the cached (game_state, world) pair was proven
+            // authoritative, not merely self-consistent.
             auto* recovered = SelectRecoveredSnapshotRoot(
                 candidates,
                 [](UObject* object) { return object_is_readable(object); },
-                [](UObject* object) { return object->GetWorld(); });
+                [](UObject* object) { return object->GetWorld(); },
+                [](UObject* world) { return read_object_property(world, STR("AuthorityGameMode")); },
+                [](UObject* game_mode) { return read_object_property(game_mode, STR("GameState")); });
             if (recovered)
             {
                 auto* world = recovered->GetWorld();
@@ -151,7 +173,7 @@ namespace MotorTown::Snapshot
                 return recovered;
             }
             log_snapshot_diag_throttled(L"unresolved",
-                std::wstring{L"active root recovery failed: no readable MotorTownGameState anchored to a live world (candidates="} +
+                std::wstring{L"active root recovery failed: no single authoritative MotorTownGameState (world AuthorityGameMode -> GameState chain, candidates="} +
                 std::to_wstring(candidates.size()) + L")");
             return nullptr;
         }

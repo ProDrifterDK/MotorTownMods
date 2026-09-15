@@ -1,25 +1,34 @@
 #pragma once
 
-#include <cstddef>
 #include <vector>
 
-// On-demand recovery selector: picks the newest admissible candidate root.
-// A candidate is admissible only when it is readable (not pending
-// destruction) and anchored to a live world; everything else is refused so
-// the caller can fail closed instead of serving freed or unanchored state.
-template <typename Candidate, typename IsReadable, typename WorldOf>
-auto SelectRecoveredSnapshotRoot(const std::vector<Candidate*>& candidates, IsReadable is_readable, WorldOf world_of) -> Candidate*
+// On-demand recovery selector: admits a candidate root only when the
+// authoritative chain proves it is the live game state of a current world:
+// readable candidate -> readable world -> readable world AuthorityGameMode
+// -> that GameMode's live game state is the exact candidate. A readable
+// orphan (not the GameMode's game state), a world without an authority game
+// mode, and unreadable/unanchored candidates are all refused. When zero or
+// multiple candidates pass the chain (both the old and the new world can be
+// readable mid-travel) the selection fails closed with nullptr so the
+// caller refuses instead of serving stale or ambiguous state.
+template <typename Candidate, typename IsReadable, typename WorldOf, typename AuthorityGameModeOf, typename GameStateOf>
+auto SelectRecoveredSnapshotRoot(const std::vector<Candidate*>& candidates, IsReadable is_readable, WorldOf world_of, AuthorityGameModeOf authority_game_mode_of, GameStateOf game_state_of) -> Candidate*
 {
-    // UObjectArray allocation order makes the last element the newest
-    // instance, so scan backwards and take the first admissible one.
-    for (auto it = candidates.rbegin(); it != candidates.rend(); ++it)
+    Candidate* admitted = nullptr;
+    for (auto* candidate : candidates)
     {
-        auto* candidate = *it;
         if (!candidate || !is_readable(candidate)) continue;
-        if (!world_of(candidate)) continue;
-        return candidate;
+        auto* world = world_of(candidate);
+        if (!world || !is_readable(world)) continue;
+        auto* game_mode = authority_game_mode_of(world);
+        if (!game_mode || !is_readable(game_mode)) continue;
+        if (game_state_of(game_mode) != candidate) continue;
+        // FindAllOf yields unique objects; a second chain-admissible
+        // candidate means two live authoritative roots: refuse, never guess.
+        if (admitted) return nullptr;
+        admitted = candidate;
     }
-    return nullptr;
+    return admitted;
 }
 
 template <typename WeakRoot, typename WeakWorld>

@@ -178,13 +178,15 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertIn("if not socket then return true end", callback)
         self.assertLess(callback.index("if not socket then return true end"), callback.index("socket.gettime()"))
 
-    def test_recovered_root_selection_fails_closed_and_prefers_newest_world_anchored_candidate(self):
-        # Named failure this catches: the on-demand recovery path must never
-        # cache a candidate that is unreadable (pending destruction) or not
-        # anchored to a live world, and must prefer the newest admissible
-        # candidate so a post-travel stale MotorTownGameState is not served to
-        # HTTP clients. A violated gate here returns freed or stale engine
-        # objects as if they were live data (fabricated/partial snapshots).
+    def test_recovered_root_selection_requires_authority_chain_and_fails_closed_on_ambiguity(self):
+        # Named failure this catches: (1) a readable but non-authoritative
+        # MotorTownGameState (orphan: the world's AuthorityGameMode is missing
+        # or its live GameState points elsewhere; or a world with no authority
+        # game mode at all) must never be served even when readable; (2) when
+        # two distinct candidates both pass the full authority chain (old and
+        # new world both readable mid-travel) selection must fail closed
+        # instead of picking an arbitrary positional "newest" UObjectArray
+        # entry, which would serve stale or fabricated state to HTTP clients.
         compiler = shutil.which("c++") or shutil.which("g++")
         if not compiler:
             self.skipTest("C++ compiler unavailable")
@@ -192,32 +194,53 @@ class SnapshotRegressionTests(unittest.TestCase):
             #include "src/active_snapshot_root.h"
             #include <cassert>
             #include <vector>
-            struct World {};
-            struct Candidate { World* world; bool readable; };
+            struct GameState;
+            struct GameMode { GameState* game_state; bool readable; };
+            struct World { GameMode* game_mode; bool readable; };
+            struct GameState { World* world; bool readable; };
             int main() {
-                World old_world, new_world;
-                const Candidate stale{&old_world, true};
-                const Candidate fresh{&new_world, true};
-                const Candidate destroyed{&new_world, false};
-                const Candidate unanchored{nullptr, true};
-                const auto readable = [](const Candidate* c) { return c->readable; };
-                const auto world_of = [](const Candidate* c) { return c->world; };
-                using Candidates = std::vector<const Candidate*>;
+                const auto readable = [](auto* object) { return object->readable; };
+                const auto world_of = [](GameState* game_state) { return game_state->world; };
+                const auto authority_game_mode_of = [](World* world) { return world->game_mode; };
+                const auto game_state_of = [](GameMode* game_mode) { return game_mode->game_state; };
+                using Candidates = std::vector<GameState*>;
+                auto select = [&](Candidates candidates) {
+                    return SelectRecoveredSnapshotRoot(candidates, readable, world_of, authority_game_mode_of, game_state_of);
+                };
+
+                GameMode old_mode{nullptr, true};
+                World old_world{&old_mode, true};
+                GameState stale{&old_world, true};
+                old_mode.game_state = &stale;   // internally consistent pre-travel world
+
+                GameMode fresh_mode{nullptr, true};
+                World fresh_world{&fresh_mode, true};
+                GameState live{&fresh_world, true};
+                fresh_mode.game_state = &live;  // authoritative current chain
+
+                GameState orphan{&fresh_world, true};   // readable but not the GameMode's live GameState
+                World client_world{nullptr, true};      // no AuthorityGameMode (no current-authority proof)
+                GameState mirrored{&client_world, true};
+                GameState destroyed{&fresh_world, false};  // pending destruction
+                GameState unanchored{nullptr, true};    // no world at all
+
                 // Empty scan (UObjectArray has no such class yet): fail closed.
-                assert(SelectRecoveredSnapshotRoot(Candidates{}, readable, world_of) == nullptr);
-                // Unreadable (pending-destroy) candidates are refused.
-                assert(SelectRecoveredSnapshotRoot(Candidates{&destroyed}, readable, world_of) == nullptr);
-                // Candidates not anchored to a live world are refused.
-                assert(SelectRecoveredSnapshotRoot(Candidates{&unanchored}, readable, world_of) == nullptr);
-                // Newest admissible candidate wins; an unreadable newer entry
-                // must not hide an older admissible one behind it.
-                assert(SelectRecoveredSnapshotRoot(Candidates{&stale, &destroyed, &fresh}, readable, world_of) == &fresh);
-                // When nothing newer is admissible, an older readable anchored
-                // candidate is still accepted (it is real live state).
-                assert(SelectRecoveredSnapshotRoot(Candidates{&stale, &unanchored}, readable, world_of) == &stale);
-                // Selection is positional: the last element is treated as the
-                // newest (UObjectArray allocation order).
-                assert(SelectRecoveredSnapshotRoot(Candidates{&fresh, &stale}, readable, world_of) == &stale);
+                assert(select(Candidates{}) == nullptr);
+                // The single authoritative candidate is admitted regardless of scan order.
+                assert(select(Candidates{&live}) == &live);
+                assert(select(Candidates{&destroyed, &orphan, &mirrored, &live}) == &live);
+                assert(select(Candidates{&live, &mirrored, &orphan, &destroyed}) == &live);
+                // Orphan: readable but not the GameMode's live GameState -> refused.
+                assert(select(Candidates{&orphan}) == nullptr);
+                // World without an AuthorityGameMode -> refused (no current-authority proof).
+                assert(select(Candidates{&mirrored}) == nullptr);
+                // Unreadable / unanchored candidates -> refused.
+                assert(select(Candidates{&destroyed}) == nullptr);
+                assert(select(Candidates{&unanchored}) == nullptr);
+                // Two fully-consistent readable chains (old + new world mid-travel):
+                // ambiguity must fail closed, never pick an arbitrary entry.
+                assert(select(Candidates{&stale, &live}) == nullptr);
+                assert(select(Candidates{&live, &stale}) == nullptr);
             }
         """)
         with tempfile.TemporaryDirectory() as directory:
@@ -225,7 +248,7 @@ class SnapshotRegressionTests(unittest.TestCase):
             binary_path = Path(directory) / "recovered"
             source_path.write_text(source)
             subprocess.run(
-                [compiler, "-std=c++20", "-I", str(ROOT), str(source_path), "-o", str(binary_path)],
+                [compiler, "-std=c++17", "-I", str(ROOT), str(source_path), "-o", str(binary_path)],
                 check=True,
             )
             subprocess.run([str(binary_path)], check=True)
@@ -255,6 +278,9 @@ class SnapshotRegressionTests(unittest.TestCase):
         recovery = source.split("auto recover_active_game_state", 1)[1].split("auto Store::begin", 1)[0]
         self.assertIn("Store::set_active_game_state(", recovery)
         self.assertNotIn("s_active_game_state =", recovery)
+        # Recovery admits a candidate only through the authority-chain selector.
+        self.assertIn("SelectRecoveredSnapshotRoot", recovery)
+        self.assertIn('STR("AuthorityGameMode")', recovery)
         resolve = source.split("auto Store::resolve_active_game_state", 1)[1].split("auto Store::push_value", 1)[0]
         self.assertIn("ResolveActiveSnapshotRoot", resolve)
         self.assertIn("recover_active_game_state()", resolve)
