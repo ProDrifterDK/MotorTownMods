@@ -51,7 +51,7 @@ local function HandleGetCharacters(session)
   local depth = tonumber(session.queryComponents.depth)
 
   local data = GetCharacters(limit, filters, depth)
-  return json.stringify { data = data }
+  return json.stringify { data = json.array(data) }
 end
 
 return {

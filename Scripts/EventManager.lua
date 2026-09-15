@@ -483,7 +483,7 @@ local function HandleGetEvents(session)
   if eventGuid and #res == 0 then
     return json.stringify { message = string.format("Event %s not found", eventGuid) }, nil, 404
   end
-  return json.stringify { data = res }
+  return json.stringify { data = json.array(res) }
 end
 
 ---Handle request for a new event
@@ -499,7 +499,7 @@ local function HandleCreateNewEvent(session)
     if status then
       LogOutput("DEBUG", "Created new event %s", output)
       local events = json.stringify {
-        data = GetEvents(output)
+        data = json.array(GetEvents(output))
       }
       return events, nil, 201
     end
@@ -554,7 +554,7 @@ local function HandleUpdateEvent(session)
         { CharacterGuid = StringToGuid(eventOwner.CharacterGuid), UniqueNetId = eventOwner.UniqueNetId })
     end
 
-    return json.stringify { data = GetEvents(eventGuid) }
+    return json.stringify { data = json.array(GetEvents(eventGuid)) }
   end
   return json.stringify { error = "Invalid payload" }, nil, 400
 end

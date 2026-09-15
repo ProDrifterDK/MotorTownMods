@@ -92,7 +92,7 @@ local function HandleGetHouses(session)
   local guid = session.pathComponents[2]
 
   local houses = GetHouses(guid)
-  return json.stringify { data = houses }
+  return json.stringify { data = json.array(houses) }
 end
 
 ---Handle request for spawning a new house for sale

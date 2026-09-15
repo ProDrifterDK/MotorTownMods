@@ -143,7 +143,7 @@ local function HandleGetPlayerStates(session)
       if playerId and #data == 0 then
         return json.stringify { message = string.format("Player with unique ID %s not found", playerId) }, nil, 404
       end
-      return json.stringify { schemaVersion = 2, data = data }, nil, 200
+      return json.stringify { schemaVersion = 2, data = json.array(data) }, nil, 200
     end
   }
 end

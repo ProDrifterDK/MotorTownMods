@@ -170,14 +170,14 @@ local function HandleGetCompanies(session)
     return json.stringify { message = string.format("Company with %s GUID not found", companyGuid) }, nil, 404
   end
 
-  return json.stringify { data = companies }
+  return json.stringify { data = json.array(companies) }
 end
 
 ---Handle request to get all depots
 ---@type RequestPathHandler
 local function HandleGetDepots(session)
   local depots = GetDepots()
-  return json.stringify { data = depots }
+  return json.stringify { data = json.array(depots) }
 end
 
 ---Handle get company depots request
@@ -200,7 +200,7 @@ local function HandleGetCompanyDepots(session)
   if buildingGuid and #data == 0 then
     return json.stringify { message = string.format("Depot with GUID %s not found", buildingGuid) }, nil, 404
   end
-  return json.stringify { data = data }
+  return json.stringify { data = json.array(data) }
 end
 
 ---Handle request to get company vehicles
@@ -219,7 +219,7 @@ local function HandleGetCompanyVehicles(session)
     -- Remove vehicle actor reference to avoid sending unnecessary data
     vehicle.VehicleActor = nil
   end
-  return json.stringify { data = vehicles }
+  return json.stringify { data = json.array(vehicles) }
 end
 
 ---Handle request to get company bus routes

@@ -50,11 +50,42 @@ local json = {}
 ---Since in Lua, `nil` values are equivalent to missing keys.
 json.null = {}
 
+-- Marker for tables declared as JSON arrays via json.array. Lua cannot
+-- distinguish an empty table from an empty object, and cjson renders every
+-- empty table as {}, so collection values must be declared explicitly to
+-- keep list endpoints emitting [] when they have no entries.
+local array_mt = {}
+
+---Declare t to be a JSON array. Returns t so call sites can wrap inline,
+---e.g. `json.stringify { data = json.array(data) }`. Empty tables carry the
+---marker so they encode as []; non-empty arrays already encode as arrays.
+---@param t table
+---@return table
+function json.array(t)
+  if next(t) == nil then
+    return setmetatable(t, array_mt)
+  end
+  return t
+end
+
+---True when obj is, or contains, a table marked by json.array. Such payloads
+---must skip the cjson fast path because cjson ignores the marker and would
+---render a marked empty table as {}; the pure-Lua encoder below honors it.
+local function contains_marked_array(obj)
+  if type(obj) ~= 'table' then return false end
+  if getmetatable(obj) == array_mt then return true end
+  for _, value in pairs(obj) do
+    if contains_marked_array(value) then return true end
+  end
+  return false
+end
+
 -- Internal functions.
 
 local function kind_of(obj)
   if type(obj) ~= 'table' then return type(obj) end
   if obj == json.null then return 'null' end
+  if getmetatable(obj) == array_mt then return 'array' end
   local i = 1
   for k in pairs(obj) do
     if obj[i] ~= nil then
@@ -134,8 +165,10 @@ end
 ---@param as_key? type
 ---@return string
 function json.stringify(obj, as_key)
-  -- Try using cjson for faster encoding
-  if cjson then
+  -- Try using cjson for faster encoding. Payloads containing an
+  -- json.array-marked table (an empty collection) must use the pure-Lua
+  -- encoder, because cjson would render the marked empty table as {}.
+  if cjson and not contains_marked_array(obj) then
     cjson.encode_sparse_array(true)
     local status, output = pcall(cjson.encode, obj)
     if status then return output end

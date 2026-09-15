@@ -126,7 +126,7 @@ local function HandleGetDeliveryPoints(session)
     return json.stringify { message = string.format("Delivery point %s not found", guid) }, nil, 404
   end
   return json.stringify {
-    data = data
+    data = json.array(data)
   }
 end
 
@@ -136,7 +136,7 @@ local function HandleGetDeliveries(session)
   local id = tonumber(session.pathComponents[2])
   local depth = tonumber(session.queryComponents.depth)
 
-  return json.stringify { data = GetDeliveries(id, depth) }
+  return json.stringify { data = json.array(GetDeliveries(id, depth)) }
 end
 
 return {
