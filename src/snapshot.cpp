@@ -38,6 +38,8 @@ namespace MotorTown::Snapshot
     FWeakObjectPtr Store::s_active_game_state{};
     FWeakObjectPtr Store::s_active_world{};
     FWeakObjectPtr Store::s_current_world{};
+    uint64_t Store::s_travel_generation{0};
+    uint64_t Store::s_open_travels{0};
 
     namespace
     {
@@ -634,94 +636,174 @@ namespace MotorTown::Snapshot
 
     auto Store::invalidate_travel_state() -> void
     {
-        // LoadMap pre notification (dllmain.cpp): the outgoing world's root
-        // cache and the current-world anchor are dropped together, under the
-        // same lock, the moment the engine announces a travel. Recovery is
-        // anchored to s_current_world, so letting the old anchor stay live
-        // here would let recovery re-admit the old world's root during the
-        // travel window and let the serve gate accept it (cached world ==
-        // stale anchor). If the matching post notification never reaches
-        // this mod for any reason (LoadMap hook not installed, an interrupt in
-        // the pinned dispatcher loop, or a travel that never posts), the
-        // anchor stays null and every endpoint keeps refusing fail-closed with
-        // the typed 503; the throttled anchor-missing diagnostic below makes
-        // that state observable in UE4SS.log.
+        // LoadMap pre notification (dllmain.cpp), delivered-only: the outgoing
+        // world's root cache and the current-world anchor are dropped together
+        // under the same lock, the monotonic generation advances, and the open
+        // travel count rises. Recovery is anchored to s_current_world, so
+        // letting the old anchor stay live here would let recovery re-admit
+        // the old world's root during the travel window and let the serve gate
+        // accept it (cached world == stale anchor). Delivered-only boundary
+        // (review-3): the pinned dispatcher gives this module no delivery
+        // guarantee, so lifecycle authority is treated as delivered only when
+        // a callback below actually runs. If the matching post never arrives
+        // (an earlier-registered peer ended the interruptible loop first, the
+        // LoadMap hook never became active, or a travel bypasses UEngine::
+        // LoadMap entirely), the anchor stays null/unresolvable and
+        // s_open_travels stays above zero: every snapshot endpoint keeps
+        // refusing fail-closed with the typed 503 and the anchor-specific
+        // diagnostic below. No dispatcher-side ordering or coverage guarantee
+        // exists or is claimed; providing one is a dispatcher-boundary change
+        // outside this module (recorded as a design gap in the lane report).
         std::lock_guard guard{s_mutex};
         s_active_game_state = nullptr;
         s_active_world = nullptr;
         s_current_world = nullptr;
+        ++s_travel_generation;
+        ++s_open_travels;
     }
 
     auto Store::set_current_world(UObject* world) -> void
     {
+        // LoadMap post notification (dllmain.cpp), delivered-only: this runs
+        // only if this mod's post callback actually ran. A refresh that
+        // degrades to null (GetThisCurrentWorld threw for the pinned engine
+        // version) still advances the generation: the pre-travel state stays
+        // refused, never silently re-armed. Closing exactly ONE open travel
+        // interval keeps a nested inner LoadMap's post from restoring serve
+        // authority while an enclosing travel is still open.
         std::lock_guard guard{s_mutex};
         s_current_world = world;
+        ++s_travel_generation;
+        if (s_open_travels > 0) --s_open_travels;
     }
 
-    auto Store::resolve_current_world() -> UObject*
+    auto Store::sample_lifecycle_state() -> SnapshotLifecycleState
     {
+        // Caller holds s_mutex. The anchor contributes its RESOLVED identity;
+        // per the pinned FWeakObjectPtr::Get default validity (verified
+        // against deps/first/Unreal/src/FWeakObjectPtr.cpp + UObjectArray.cpp)
+        // a null/stale-serial, Unreachable or PendingKill world resolves to
+        // null, which the seams treat as unavailable authority. Anchors that
+        // only weak resolution keeps alive are refused again by
+        // object_is_readable (RF_BeginDestroyed/RF_FinishDestroyed are NOT
+        // weak checks) inside the serve gate.
+        return SnapshotLifecycleState{
+            static_cast<const void*>(s_current_world.Get()),
+            s_travel_generation,
+            s_open_travels,
+        };
+    }
+
+    auto Store::store_active_game_state_if_current(const SnapshotLifecycleState& sampled, UObject* game_state, UObject* world) -> bool
+    {
+        // Final decision point for the recovery path (review-3 P2): the
+        // admission decision and the store share one critical section, so a
+        // concurrent invalidate_travel_state/set_current_world cannot land
+        // between the check and the store. The decision itself is the pure
+        // seam the tests execute; a generation that advanced after the
+        // resolution's entry sample refuses the store entirely.
         std::lock_guard guard{s_mutex};
-        // Pinned FWeakObjectPtr::Get default validity (verified against
-        // deps/first/Unreal/src/FWeakObjectPtr.cpp + UObjectArray.cpp):
-        // rejects null/stale-serial identities, Unreachable and PendingKill
-        // referents. RF_BeginDestroyed/RF_FinishDestroyed are NOT weak
-        // checks; this module rejects those separately in object_is_readable.
-        // A dead anchor therefore refuses here instead of serving as a stale
-        // identity anchor.
-        return s_current_world.Get();
+        if (!AdmissionStillValid(sampled, sample_lifecycle_state())) return false;
+        s_active_game_state = game_state;
+        s_active_world = world;
+        return true;
     }
 
     auto Store::resolve_active_game_state() -> UObject*
     {
-        // The capture binding only reaches here on the authorized GameThread;
-        // refuse any other caller before touching engine state (Run-13 D2
-        // defect class). This also covers the cached fast path: weak-pointer
-        // resolution and reflection reads are game-thread state too.
-        if (!LuaMod::is_in_game_thread())
+        // Entry preconditions and every lifecycle admission decision below run
+        // through the pure seams in active_snapshot_root.h
+        // (EvaluateResolutionPreconditions / AdmissionStillValid), which the
+        // test suite executes directly; production supplies the live inputs.
+        const bool on_game_thread = LuaMod::is_in_game_thread();
+        // The thread check must win before ANY engine read: sampling resolves
+        // the anchor weak pointer (engine object-array state), so an
+        // unauthorized caller leaves the sample all-unavailable and is refused
+        // by the seam's first case without the read ever happening (Run-13 D2
+        // defect class).
+        SnapshotLifecycleState sampled;
+        if (on_game_thread)
         {
-            log_snapshot_diag_throttled(L"off-thread", L"active root resolution refused: not on the GameThread");
-            return nullptr;
+            std::lock_guard guard{s_mutex};
+            sampled = sample_lifecycle_state();
+        }
+        switch (EvaluateResolutionPreconditions(on_game_thread, sampled))
+        {
+            case SnapshotResolutionRefusal::OffGameThread:
+            {
+                log_snapshot_diag_throttled(L"off-thread",
+                    L"active root resolution refused: not on the GameThread");
+                return nullptr;
+            }
+            case SnapshotResolutionRefusal::AnchorMissing:
+            {
+                // Anchor-specific, observable at LogLevel::Normal. The anchor
+                // is null OR its weak pointer no longer resolves; the causes
+                // are listed, not diagnosed: a delivered LoadMap pre
+                // invalidated it and no matching post has been delivered to
+                // this mod (interrupted loop, inactive hook), the refreshed
+                // anchor never resolved, or the refreshed world died. Fail
+                // closed, never serve stale.
+                log_snapshot_diag_throttled(L"anchor-missing",
+                    L"active root unavailable: current-world anchor missing or unresolvable (a delivered LoadMap pre invalidated it and no matching post has re-established a resolvable anchor, or the LoadMap hook is inactive)");
+                return nullptr;
+            }
+            case SnapshotResolutionRefusal::TravelInProgress:
+            {
+                // Non-null anchor but a travel interval is still open (e.g. a
+                // nested inner LoadMap's post refreshed the anchor while the
+                // enclosing travel runs). Refuse until the enclosing post is
+                // delivered; never serve across an open travel.
+                log_snapshot_diag_throttled(L"travel-open",
+                    L"active root unavailable: a LoadMap travel interval is open (pre delivered, matching post not yet delivered to this mod); refusing until lifecycle authority is delivered");
+                return nullptr;
+            }
+            case SnapshotResolutionRefusal::Proceed:
+                break;
         }
 
-        // Engine-established current-world identity: without it no root can be
-        // proven current, so neither the cache nor recovery may serve. The
-        // anchor is captured inside the pinned overlay's LoadMap post callback
-        // (dllmain.cpp) as a weak pointer; if the LoadMap hook is disabled, the
-        // detour never installed, or the recorded world is gone, everything
-        // below refuses fail-closed instead of serving a guess.
-        UObject* current_world = resolve_current_world();
-        const void* current_world_identity = static_cast<const void*>(current_world);
         const auto read_authority_mode = [](UObject* world) { return read_object_property(world, STR("AuthorityGameMode")); };
         const auto read_mode_game_state = [](UObject* game_mode) { return read_object_property(game_mode, STR("GameState")); };
+
+        // Cached fast path first: recovery is the failure path, never a
+        // per-request scan. The validity check and the weak gate run under ONE
+        // lock acquisition, so a concurrent travel writer cannot land between
+        // them; a sample overtaken by an invalidation or refresh (generation
+        // advanced) is never served here. The gate re-reads the authority
+        // backlink through reflection on every serve, so a pair whose world
+        // lost its authority (or whose GameMode re-pointed its GameState) is
+        // refused too.
         const auto serve_cached = [&]() -> UObject* {
             std::lock_guard guard{s_mutex};
+            const auto live = sample_lifecycle_state();
+            if (!AdmissionStillValid(sampled, live)) return nullptr;
             return ResolveServedSnapshotRoot(
-                s_active_game_state, s_active_world, current_world_identity,
+                s_active_game_state, s_active_world, live.current_world,
                 [](UObject* object) { return object_is_readable(object); },
                 read_authority_mode,
                 read_mode_game_state);
         };
-
-        // Cached fast path first: recovery is the failure path, never a
-        // per-request scan. The gate re-reads the authority backlink through
-        // reflection on every serve, so a pair whose world lost its authority
-        // (or whose GameMode re-pointed its GameState) is refused here.
         if (auto* cached = serve_cached()) return cached;
 
-        if (!current_world)
+        // If the lifecycle state advanced after the entry sample (a travel
+        // interval opened or completed between sampling and here), the sampled
+        // anchor identity is stale: refuse this resolution instead of scanning
+        // against it. The next request re-samples fresh state; nothing stale
+        // is scanned, stored or returned.
+        bool lifecycle_advanced = false;
         {
-            // Anchor-specific, observable at LogLevel::Normal: a missing
-            // anchor is exactly the state a travel sits in between the pre
-            // invalidation and the post refresh, and permanently so when no
-            // post notification ever reaches this mod. Fail closed, never
-            // serve stale.
-            log_snapshot_diag_throttled(L"anchor-missing",
-                L"active root unavailable: current-world anchor missing (LoadMap pre cleared it; the matching post notification has not been delivered to this mod, or the LoadMap hook is inactive)");
+            std::lock_guard guard{s_mutex};
+            lifecycle_advanced = !AdmissionStillValid(sampled, sample_lifecycle_state());
+        }
+        if (lifecycle_advanced)
+        {
+            log_snapshot_diag_throttled(L"lifecycle-changed",
+                L"active root resolution refused: the travel lifecycle advanced after the resolution sampled it (invalidation or anchor refresh); the next request re-samples current state");
             return nullptr;
         }
 
         const auto decision = RecoverActiveSnapshotRoot<UObject>(
-            true, current_world_identity,
+            on_game_thread, sampled.current_world,
             [&]() {
                 std::vector<UObject*> found;
                 Unreal::UObjectGlobals::FindAllOf(STR("MotorTownGameState"), found);
@@ -744,42 +826,59 @@ namespace MotorTown::Snapshot
                 return nullptr;
             case SnapshotRecoveryOutcome::OffGameThread:
             case SnapshotRecoveryOutcome::NoCurrentWorld:
-                // Unreachable: both preconditions were checked above and the
-                // pure decision refuses before scanning without them.
+                // Unreachable: EvaluateResolutionPreconditions enforced both
+                // preconditions at entry (the pure decision re-checks them
+                // before its scan) and this is the same sampled-once thread
+                // flag.
                 return nullptr;
             case SnapshotRecoveryOutcome::Recovered:
                 break;
         }
 
-        // Same ordering discipline as the serve gate: GetWorld/GetName are
-        // engine virtuals, so the recovered root and its world pass a fresh
-        // gameplay-readability check BEFORE either is called. A root that
-        // became unreachable between the scan and here is refused without
-        // being dereferenced into engine code.
-        if (!object_is_readable(decision.admitted))
+        // Same ordering discipline as the serve gate, through the pure seam the
+        // tests execute (EvaluateRecoveredTail): the recovered root passes a
+        // fresh gameplay-readability check BEFORE the engine world read
+        // (GetWorld() is an engine virtual wrapper) runs on it, and the world
+        // is gated too, so nothing unreadable reaches the GetName() engine
+        // reads in the recovery diagnostic or the cache below.
+        const auto tail = EvaluateRecoveredTail(
+            decision.admitted,
+            [](UObject* object) { return object_is_readable(object); },
+            [](UObject* object) -> UObject* { return object->GetWorld(); });
+        switch (tail.verdict)
         {
-            log_snapshot_diag_throttled(L"recovered-unreadable",
-                L"active root recovery aborted: recovered root became unreadable before caching");
+            case RecoveredTailVerdict::RootUnreadable:
+                log_snapshot_diag_throttled(L"recovered-unreadable",
+                    L"active root recovery aborted: recovered root became unreadable before caching");
+                return nullptr;
+            case RecoveredTailVerdict::WorldMissingOrUnreadable:
+                log_snapshot_diag_throttled(L"recovered-unreadable",
+                    L"active root recovery aborted: recovered root's world is missing or unreadable before caching");
+                return nullptr;
+            case RecoveredTailVerdict::Cacheable:
+                break;
+        }
+
+        // Final decision point (review-3 P2): check-and-store share one
+        // critical section, so a pair admitted against generation N is never
+        // STORED once the generation advanced.
+        if (!store_active_game_state_if_current(sampled, decision.admitted, tail.world))
+        {
+            log_snapshot_diag_throttled(L"lifecycle-changed",
+                L"active root recovery discarded: the travel lifecycle advanced between the scan and the cache; the next request recovers against the refreshed state");
             return nullptr;
         }
-        auto* world = decision.admitted->GetWorld();
-        if (!world || !object_is_readable(world))
-        {
-            log_snapshot_diag_throttled(L"recovered-unreadable",
-                L"active root recovery aborted: recovered root's world is missing or unreadable before caching");
-            return nullptr;
-        }
-        Store::set_active_game_state(decision.admitted, world);
         log_snapshot_diag_throttled(L"recovered",
             std::wstring{L"active root recovered on demand (game_state="} + decision.admitted->GetName() +
-            L" world=" + world->GetName() + L")");
-        // Never return a pointer the stored weak root/world cannot resolve:
-        // the recovered candidate is served through the exact same weak-cache
-        // gate as every other path (final weak re-resolution). That gate
-        // refuses any weak-serial/unreadable state visible at the check
-        // itself; it does not pin the objects, so a GC or PendingKill that
-        // lands after the check is not modeled here. The recovered raw
-        // pointer never escapes this function directly.
+            L" world=" + tail.world->GetName() + L")");
+        // The caller observes only what the weak-cache gate re-resolves NOW:
+        // serve_cached re-validates generation/anchor/open-travels under one
+        // lock before returning, so a pair admitted against generation N is
+        // never RETURNED after the generation advanced. That gate refuses any
+        // weak-serial/unreadable state visible at the check itself; it does
+        // not pin the objects, so a GC or PendingKill that lands after the
+        // check is not modeled here. The recovered raw pointer never escapes
+        // this function directly.
         return serve_cached();
     }
 

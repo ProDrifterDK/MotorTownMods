@@ -1,12 +1,15 @@
 #pragma once
 
+#include <cstdint>
+#include <type_traits>
 #include <vector>
 
-// Pure decision logic for active-snapshot-root recovery and cache reuse.
-// Nothing here touches Unreal: the caller supplies callables for the scan,
-// readability and reflection reads, so the full admission/refusal sequence
-// is compiled and executed by tests without engine headers. The production
-// wiring lives in src/snapshot.cpp.
+// Pure decision logic for active-snapshot-root recovery, cache reuse and
+// travel-lifecycle authority. Nothing here touches Unreal: the caller
+// supplies the lifecycle samples and callables for the scan, readability and
+// reflection reads, so the full admission/refusal sequence is compiled and
+// executed by tests without engine headers. The production wiring lives in
+// src/snapshot.cpp.
 
 // Why a recovery attempt was refused or admitted. The production caller maps
 // each outcome to a throttled [SnapshotDiag] line.
@@ -56,6 +59,90 @@ auto RecoverActiveSnapshotRoot(bool on_game_thread, const void* current_world, S
         admitted = candidate;
     }
     return {admitted, admitted ? SnapshotRecoveryOutcome::Recovered : SnapshotRecoveryOutcome::Unresolved};
+}
+
+// Sampled travel-lifecycle authority state (plain data; no engine types).
+// Production fills it from the Store under one lock (snapshot.cpp
+// sample_lifecycle_state); tests construct and mutate it directly.
+struct SnapshotLifecycleState
+{
+    // Resolved engine-anchor identity (FWorldContext::GetThisCurrentWorld,
+    // captured inside the pinned overlay's LoadMap post callback). Null means
+    // no usable anchor: never delivered, invalidated and not yet refreshed, or
+    // the weak pointer no longer resolves.
+    const void* current_world{};
+    // Monotonic: advanced on every travel invalidation (LoadMap pre) and every
+    // anchor refresh (LoadMap post). Any advance invalidates admissions
+    // sampled before it.
+    uint64_t travel_generation{};
+    // Delivered LoadMap pre notifications whose matching post has not been
+    // delivered. While this is non-zero a travel interval is open; an inner
+    // travel's post must not restore serve authority while an enclosing
+    // LoadMap is still open.
+    uint64_t open_travels{};
+};
+
+enum class SnapshotResolutionRefusal
+{
+    Proceed,          // preconditions hold; resolution may continue
+    OffGameThread,    // refused first, before any state consultation
+    AnchorMissing,    // no resolved engine anchor: nothing can be proven current
+    TravelInProgress  // a LoadMap interval is open; authority not yet delivered
+};
+
+// Entry precondition seam for Store::resolve_active_game_state. The thread
+// check wins FIRST so an unauthorized caller is refused no matter how healthy
+// the sampled state looks (production therefore samples the lifecycle state
+// only after its own thread check has passed).
+inline auto EvaluateResolutionPreconditions(bool on_game_thread, const SnapshotLifecycleState& state) -> SnapshotResolutionRefusal
+{
+    if (!on_game_thread) return SnapshotResolutionRefusal::OffGameThread;
+    if (!state.current_world) return SnapshotResolutionRefusal::AnchorMissing;
+    if (state.open_travels != 0) return SnapshotResolutionRefusal::TravelInProgress;
+    return SnapshotResolutionRefusal::Proceed;
+}
+
+// Final decision-point seam. A pair admitted against the sampled state may be
+// stored or returned only while the LIVE lifecycle state still matches the
+// sample field for field: the generation has not advanced (no invalidation or
+// refresh happened since sampling), no travel interval is open, and the
+// anchor is the same identity. Every field is load-bearing: any drift refuses
+// fail-closed, and the next request re-samples fresh state.
+inline auto AdmissionStillValid(const SnapshotLifecycleState& sampled, const SnapshotLifecycleState& live) -> bool
+{
+    return sampled.travel_generation == live.travel_generation &&
+           sampled.open_travels == live.open_travels &&
+           sampled.current_world == live.current_world;
+}
+
+enum class RecoveredTailVerdict
+{
+    Cacheable,                // world returned; caching/serving may proceed
+    RootUnreadable,           // admitted root failed the gameplay gate; no engine world read ran on it
+    WorldMissingOrUnreadable  // the world read returned null or failed the gameplay gate
+};
+
+template <typename World>
+struct RecoveredTailResult
+{
+    RecoveredTailVerdict verdict{};
+    World* world{};
+};
+
+// Recovery-tail seam. Same ordering discipline as the cache gate: the
+// recovered root passes a fresh gameplay-readability check BEFORE the engine
+// world read (world_of) runs on it, and the read result is gated too, so an
+// unreadable root is never dereferenced into engine code. world_of is invoked
+// at most once, and only after the root passed the gate.
+template <typename Candidate, typename IsReadable, typename WorldOf>
+auto EvaluateRecoveredTail(Candidate* admitted, IsReadable is_readable, WorldOf world_of) -> RecoveredTailResult<std::remove_pointer_t<decltype(world_of(admitted))>>
+{
+    if (!admitted || !is_readable(admitted))
+        return {RecoveredTailVerdict::RootUnreadable, nullptr};
+    auto* world = world_of(admitted);
+    if (!world || !is_readable(world))
+        return {RecoveredTailVerdict::WorldMissingOrUnreadable, nullptr};
+    return {RecoveredTailVerdict::Cacheable, world};
 }
 
 // Cache-reuse gate. A cached pair is served only when:

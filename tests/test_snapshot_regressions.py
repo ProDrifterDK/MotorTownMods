@@ -460,6 +460,27 @@ class SnapshotRegressionTests(unittest.TestCase):
                     GameState alien{nullptr};
                     assert(serve(Weak<GameState>{&alien}, other_world_weak, &world) == nullptr);
                 }
+                // Isolated weak-resolvable, otherwise-authoritative pairs whose
+                // WORLD carries the module-added RF destroyed flags (review-3
+                // Y1: weak resolution does not reject them; without the world
+                // readability gate such a pair would be served). The refusal
+                // must happen BEFORE the root's GetWorld engine virtual runs.
+                {
+                    GameMode anchored_mode{nullptr};
+                    World begin_destroyed_world{&anchored_mode, Flag::BeginDestroyed};
+                    GameState anchored{&begin_destroyed_world};
+                    anchored_mode.game_state = &anchored;
+                    assert(serve(Weak<GameState>{&anchored}, Weak<World>{&begin_destroyed_world}, &begin_destroyed_world) == nullptr);
+                    assert(anchored.get_world_calls == 0);
+                }
+                {
+                    GameMode anchored_mode{nullptr};
+                    World finish_destroyed_world{&anchored_mode, Flag::FinishDestroyed};
+                    GameState anchored{&finish_destroyed_world};
+                    anchored_mode.game_state = &anchored;
+                    assert(serve(Weak<GameState>{&anchored}, Weak<World>{&finish_destroyed_world}, &finish_destroyed_world) == nullptr);
+                    assert(anchored.get_world_calls == 0);
+                }
             }
         """)
         with tempfile.TemporaryDirectory() as directory:
@@ -467,6 +488,188 @@ class SnapshotRegressionTests(unittest.TestCase):
             binary_path = Path(directory) / "served"
             source_path.write_text(source)
             subprocess.run([compiler, "-std=c++17", "-I", str(ROOT), str(source_path), "-o", str(binary_path)], check=True)
+            subprocess.run([str(binary_path)], check=True)
+
+    def test_lifecycle_authority_seams_refuse_off_thread_open_travels_and_advanced_generations(self):
+        # Named failures this catches (review-3 P2): the travel-authority
+        # decisions that gate every serve/admission are pure seams production
+        # calls, and the tests must EXECUTE them, not grep for them.
+        # (1) An off-game-thread caller is refused first, even against an
+        # otherwise perfectly servable sample. (2) A stuck travel (pre
+        # delivered, matching post never delivered) refuses on the null anchor.
+        # (3) The review-3 nested-LoadMap counterexample: an inner post
+        # re-established a non-null anchor while the ENCLOSING travel is still
+        # open - the open-travel count refuses; an inner post must not restore
+        # serve authority. (4) The review-3 concurrent-delivery counterexample:
+        # the resolver's entry sample predates a completed travel, so the
+        # final admission revalidation must refuse: a pair admitted against
+        # generation N is neither stored nor returned once the generation
+        # advanced - including the same-world schedule where the anchor
+        # identity is unchanged and ONLY the generation moved.
+        compiler = shutil.which("c++") or shutil.which("g++")
+        if not compiler:
+            self.skipTest("C++ compiler unavailable")
+        source = textwrap.dedent(r"""
+            #include "src/active_snapshot_root.h"
+            #include <cassert>
+            #include <cstdint>
+            int main() {
+                using R = SnapshotResolutionRefusal;
+                const void* world_a = reinterpret_cast<const void*>(uintptr_t{0x1000});
+                const void* world_b = reinterpret_cast<const void*>(uintptr_t{0x2000});
+
+                // (1) Off-thread refusal wins FIRST: no field consultation can
+                // admit an unauthorized caller, whatever the sample holds.
+                {
+                    const SnapshotLifecycleState healthy{world_a, 7, 0};
+                    assert(EvaluateResolutionPreconditions(false, healthy) == R::OffGameThread);
+                }
+                // (2) On-thread, no open travel, but no delivered anchor
+                // (stuck travel: pre delivered, post never delivered).
+                {
+                    const SnapshotLifecycleState unanchored{nullptr, 7, 0};
+                    assert(EvaluateResolutionPreconditions(true, unanchored) == R::AnchorMissing);
+                    const SnapshotLifecycleState stuck{nullptr, 7, 1};
+                    assert(EvaluateResolutionPreconditions(true, stuck) == R::AnchorMissing);
+                }
+                // (3) Nested LoadMap (review-3 counterexample 1): outer pre
+                // and inner pre delivered, then the INNER post refreshed the
+                // anchor. Non-null anchor, but the enclosing travel is still
+                // open: refuse; an inner post must not restore serve authority.
+                {
+                    const SnapshotLifecycleState nested{world_a, 9, 1};
+                    assert(EvaluateResolutionPreconditions(true, nested) == R::TravelInProgress);
+                }
+                // (4) Delivered, quiescent state proceeds.
+                {
+                    const SnapshotLifecycleState healthy{world_a, 9, 0};
+                    assert(EvaluateResolutionPreconditions(true, healthy) == R::Proceed);
+                }
+
+                // Final decision point: the entry sample vs the live state at
+                // store/return time.
+                const SnapshotLifecycleState sampled{world_a, 4, 0};
+                const SnapshotLifecycleState same{world_a, 4, 0};
+                // Same-world travel: pre+post delivered, anchor identity
+                // unchanged, generation advanced. Anchor equality alone must
+                // NOT admit.
+                const SnapshotLifecycleState advanced{world_a, 6, 0};
+                // Full travel to another world (review-3 counterexample 2).
+                const SnapshotLifecycleState replaced{world_b, 6, 0};
+                // New travel opened after the sample.
+                const SnapshotLifecycleState reopened{nullptr, 5, 1};
+
+                assert(AdmissionStillValid(sampled, same));
+                assert(!AdmissionStillValid(sampled, advanced));
+                assert(!AdmissionStillValid(sampled, replaced));
+                assert(!AdmissionStillValid(sampled, reopened));
+                // Each field is load-bearing: any single drift refuses.
+                assert(!AdmissionStillValid(sampled, SnapshotLifecycleState{world_b, 4, 0}));
+                assert(!AdmissionStillValid(sampled, SnapshotLifecycleState{world_a, 4, 1}));
+                assert(!AdmissionStillValid(sampled, SnapshotLifecycleState{world_a, 5, 0}));
+            }
+        """)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "lifecycle.cpp"
+            binary_path = Path(directory) / "lifecycle"
+            source_path.write_text(source)
+            subprocess.run(
+                [compiler, "-std=c++17", "-I", str(ROOT), str(source_path), "-o", str(binary_path)],
+                check=True,
+            )
+            subprocess.run([str(binary_path)], check=True)
+
+    def test_recovered_tail_seam_refuses_unreadable_root_before_engine_world_read(self):
+        # Named failures this catches (review-3 Y5/Y6): the recovery tail's
+        # safety decision is a pure seam production calls
+        # (EvaluateRecoveredTail), and the tests execute it. The seam must
+        # refuse an unreadable admitted root BEFORE invoking the engine world
+        # read (the access spy stays zero - review-3's Y5 mutation moves the
+        # readability check after world_of, and Y6 disables the guard; both
+        # reorderings bite here), refuse a missing or unreadable world, and
+        # return the world only for a fully readable pair.
+        compiler = shutil.which("c++") or shutil.which("g++")
+        if not compiler:
+            self.skipTest("C++ compiler unavailable")
+        source = textwrap.dedent(r"""
+            #include "src/active_snapshot_root.h"
+            #include <cassert>
+            enum class Flag { None, PendingKill, BeginDestroyed, FinishDestroyed };
+            struct World { Flag flag = Flag::None; };
+            struct GameState {
+                World* world; Flag flag = Flag::None;
+                mutable int world_reads = 0; // engine world-read access spy
+                World* GetWorld() const { ++world_reads; return world; }
+            };
+            int main() {
+                const auto readable = [](const auto* object) { return object && object->flag == Flag::None; };
+                const auto world_of = [](GameState* game_state) { return game_state->GetWorld(); };
+                World world{};
+                GameState live{&world};
+
+                // Healthy recovered pair: cacheable, world returned, the
+                // engine world read ran exactly once on a readable root.
+                {
+                    const auto tail = EvaluateRecoveredTail(&live, readable, world_of);
+                    assert(tail.verdict == RecoveredTailVerdict::Cacheable);
+                    assert(tail.world == &world);
+                    assert(live.world_reads == 1);
+                }
+                // Weak-resolvable, otherwise-authoritative roots that only the
+                // module's gameplay gate rejects: refused, and the engine world
+                // read NEVER runs on them.
+                {
+                    GameState begin_destroyed{&world, Flag::BeginDestroyed};
+                    const auto tail = EvaluateRecoveredTail(&begin_destroyed, readable, world_of);
+                    assert(tail.verdict == RecoveredTailVerdict::RootUnreadable);
+                    assert(tail.world == nullptr);
+                    assert(begin_destroyed.world_reads == 0);
+                }
+                {
+                    GameState finish_destroyed{&world, Flag::FinishDestroyed};
+                    const auto tail = EvaluateRecoveredTail(&finish_destroyed, readable, world_of);
+                    assert(tail.verdict == RecoveredTailVerdict::RootUnreadable);
+                    assert(finish_destroyed.world_reads == 0);
+                }
+                {
+                    GameState pending{&world, Flag::PendingKill};
+                    const auto tail = EvaluateRecoveredTail(&pending, readable, world_of);
+                    assert(tail.verdict == RecoveredTailVerdict::RootUnreadable);
+                    assert(pending.world_reads == 0);
+                }
+                // Readable root whose world read returns null: refused, after
+                // the (single) world read.
+                {
+                    GameState orphaned{nullptr};
+                    const auto tail = EvaluateRecoveredTail(&orphaned, readable, world_of);
+                    assert(tail.verdict == RecoveredTailVerdict::WorldMissingOrUnreadable);
+                    assert(orphaned.world_reads == 1);
+                }
+                // Readable root whose world is weak-resolvable but carries the
+                // module-only RF destroyed flags (review-3 Y1 family, recovery
+                // tail side): refused at the world gate.
+                {
+                    World dying_world{Flag::BeginDestroyed};
+                    GameState rooted{&dying_world};
+                    const auto tail = EvaluateRecoveredTail(&rooted, readable, world_of);
+                    assert(tail.verdict == RecoveredTailVerdict::WorldMissingOrUnreadable);
+                    assert(rooted.world_reads == 1);
+                }
+                // Null admitted pointer: refused without any read.
+                {
+                    const auto tail = EvaluateRecoveredTail<GameState>(nullptr, readable, world_of);
+                    assert(tail.verdict == RecoveredTailVerdict::RootUnreadable);
+                }
+            }
+        """)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "tail.cpp"
+            binary_path = Path(directory) / "tail"
+            source_path.write_text(source)
+            subprocess.run(
+                [compiler, "-std=c++17", "-I", str(ROOT), str(source_path), "-o", str(binary_path)],
+                check=True,
+            )
             subprocess.run([str(binary_path)], check=True)
 
     def test_loadmap_travel_invalidates_anchor_and_fails_closed_until_post(self):
@@ -478,14 +681,16 @@ class SnapshotRegressionTests(unittest.TestCase):
         # is interruptible in general. While the stale anchor stayed live,
         # recovery re-admitted the old world's root and the serve gate accepted
         # it (cached world == stale anchor). The fix invalidates cache AND
-        # anchor together inside the pre notification and rotates this mod's
-        # callback to the FRONT of both vectors, so an earlier-registered peer
-        # cannot end a loop before ours has run; a post notification that still
-        # never reaches this mod leaves a permanent typed 503 with the
-        # throttled anchor-missing diagnostic instead of stale state.
-        # The compiled half executes the real production gate/recovery logic
-        # over the pre/capture/post event sequence; the source half pins the
-        # Store and dllmain wiring that feeds it.
+        # anchor together inside the pre notification; a post notification that
+        # never reaches this mod leaves the store unable to serve (typed 503
+        # with the throttled anchor-missing diagnostic) instead of stale state.
+        # Review-3 P1 correction: the earlier front-rotation of this mod's
+        # callback is GONE - the dispatcher-owned vectors are never written,
+        # delivery is enforced as delivered-only, and lifecycle authority is
+        # generation-checked (see the lifecycle seam test). The compiled half
+        # executes the real production gate/recovery logic over the
+        # pre/capture/post event sequence; the source half pins the Store and
+        # dllmain wiring that feeds it.
         compiler = shutil.which("c++") or shutil.which("g++")
         if compiler:
             source = textwrap.dedent(r"""
@@ -582,64 +787,99 @@ class SnapshotRegressionTests(unittest.TestCase):
         else:
             self.skipTest("C++ compiler unavailable")
 
-        # Store wiring: one lock, all three travel-derived pointers dropped.
+        # Store wiring. Source pin only: the mutex, generation and counter
+        # updates cannot execute on this harness (they are engine-coupled
+        # Store internals); what is pinned is that the pre invalidation drops
+        # all three travel-derived pointers and advances the travel
+        # bookkeeping under the store lock guard, and the post refresh
+        # advances the generation and closes exactly one open travel.
         source = (ROOT / "src/snapshot.cpp").read_text()
         invalidate_body = source.split("auto Store::invalidate_travel_state", 1)[1].split("auto Store::set_current_world", 1)[0]
+        self.assertIn("std::lock_guard guard{s_mutex};", invalidate_body)
         self.assertIn("s_active_game_state = nullptr;", invalidate_body)
         self.assertIn("s_active_world = nullptr;", invalidate_body)
         self.assertIn("s_current_world = nullptr;", invalidate_body)
+        self.assertIn("++s_travel_generation;", invalidate_body)
+        self.assertIn("++s_open_travels;", invalidate_body)
+        set_body = source.split("auto Store::set_current_world", 1)[1].split("auto Store::sample_lifecycle_state", 1)[0]
+        self.assertIn("s_current_world = world;", set_body)
+        self.assertIn("++s_travel_generation;", set_body)
+        self.assertIn("--s_open_travels;", set_body)
+        # The final admission revalidation and the atomic check-and-store are
+        # wired into the resolver (behavior compiled-tested in the lifecycle
+        # and tail seam tests).
+        self.assertIn("AdmissionStillValid(", source)
+        self.assertIn("store_active_game_state_if_current(", source)
         # The anchor-missing refusal is observable at a level <= Normal.
         self.assertIn('L"anchor-missing"', source)
+        self.assertIn('L"travel-open"', source)
 
         # dllmain wiring: the PRE notification invalidates travel state (not
         # merely the root cache), the POST notification refreshes the anchor,
-        # and each just-registered callback is moved to the FRONT of its
-        # pinned dispatcher vector so no earlier-registered peer can end the
-        # interruptible loop before ours has run.
+        # and the dispatcher-owned callback vectors are NEVER written
+        # (review-3 P1: the front rotation is deleted; delivery is enforced as
+        # delivered-only, not ordered into place).
         dll = (ROOT / "src/dllmain.cpp").read_text()
         pre_body = dll.split("RegisterLoadMapPreCallback(", 1)[1].split("RegisterLoadMapPostCallback(", 1)[0]
         self.assertIn("Store::invalidate_travel_state()", pre_body)
         self.assertNotIn("clear_active_game_state", pre_body)
         post_body = dll.split("RegisterLoadMapPostCallback(", 1)[1].split("RegisterInitGameStatePostCallback", 1)[0]
         self.assertIn("Store::set_current_world(", post_body)
-        pre_rotate = "move_just_registered_to_front(Unreal::Hook::StaticStorage::LoadMapPreCallbacks)"
-        post_rotate = "move_just_registered_to_front(Unreal::Hook::StaticStorage::LoadMapPostCallbacks)"
-        self.assertIn(pre_rotate, dll)
-        self.assertIn(post_rotate, dll)
-        self.assertLess(dll.index("RegisterLoadMapPreCallback("), dll.index(pre_rotate))
-        self.assertLess(dll.index("RegisterLoadMapPostCallback("), dll.index(post_rotate))
+        # Absence proof: no rotation helper, no std::rotate, and the only
+        # remaining uses of the dispatcher-owned vectors are read-only
+        # diagnostic .size() registration counts.
+        self.assertNotIn("std::rotate", dll)
+        self.assertNotIn("move_just_registered_to_front", dll)
+        for vector_name in ("LoadMapPreCallbacks", "LoadMapPostCallbacks"):
+            uses = [line.strip() for line in dll.splitlines() if vector_name in line]
+            self.assertTrue(
+                uses and all(".size()" in use and use.startswith("const size_t") for use in uses),
+                f"{vector_name}: only read-only .size() diagnostics may remain, found: {uses}",
+            )
 
     def test_snapshot_recovery_runs_only_on_authorized_game_thread(self):
         # Named failure this catches: the recovery path scans the global
         # UObjectArray (FindAllOf). If that scan can run from the HTTP worker
         # thread, it races the game thread's object mutations exactly like the
-        # Run-13 D2 defect class. The behavioral bite (the guard prevents the
-        # scan, spy stays at zero) is compiled-tested in
-        # test_recovery_refuses_off_thread_unanchored_and_unreadable_chains;
+        # Run-13 D2 defect class. The BEHAVIORAL bite (off-thread refused
+        # first, before any state consultation) is compiled-tested against the
+        # production seam in
+        # test_lifecycle_authority_seams_refuse_off_thread_open_travels_and_advanced_generations;
         # this check pins the production WIRING to that compiled logic: the
-        # whole resolution (cache gate included) sits behind the GameThread
-        # guard, and the FindAllOf call exists exactly once, inside the
+        # thread flag is read once, the entry precondition seam is consulted
+        # BEFORE the anchor sample (a weak resolution is an engine read), the
+        # off-thread refusal case is a braced switch body that logs and
+        # returns, and the FindAllOf call exists exactly once, inside the
         # recovery decision's scan lambda.
         source = (ROOT / "src/snapshot.cpp").read_text()
         resolve = source.split("auto Store::resolve_active_game_state", 1)[1].split("auto Store::push_value", 1)[0]
         self.assertIn("LuaMod::is_in_game_thread()", resolve)
-        # The refusal must live INSIDE the guard's braced body (review-2 X2:
-        # deleting only the guard's 'return nullptr' kept the suite green when
-        # merely the guard text and its order were checked).
-        guard = re.search(r"if \(!LuaMod::is_in_game_thread\(\)\)\s*\{([^{}]*)\}", resolve)
-        self.assertTrue(guard, "the off-thread refusal must be a braced guard block")
-        guard_body = guard.group(1)
-        self.assertIn("log_snapshot_diag_throttled", guard_body)
-        self.assertIn("return nullptr;", guard_body)
-        self.assertLess(guard_body.index("log_snapshot_diag_throttled"), guard_body.index("return nullptr;"))
+        self.assertIn("EvaluateResolutionPreconditions(on_game_thread, sampled)", resolve)
+        # The lifecycle sample (engine read) must sit inside the guarded block
+        # that only runs once the thread flag passed, so an unauthorized
+        # caller never triggers it.
+        guarded_sample = re.search(r"if \(on_game_thread\)\s*\{((?:[^{}]|\{[^{}]*\})*)\}", resolve)
+        self.assertTrue(guarded_sample, "the lifecycle sample must be gated on the thread flag")
+        self.assertIn("sample_lifecycle_state()", guarded_sample.group(1))
+        # The refusal must live INSIDE the case's braced body (review-2 X2 /
+        # review-3 Y3: deleting or disabling only the refusal kept older
+        # checks green when merely the guard text and its order were matched).
+        off_case = re.search(r"case SnapshotResolutionRefusal::OffGameThread:\s*\{([^{}]*)\}", resolve)
+        self.assertTrue(off_case, "the off-thread refusal must be a braced switch case")
+        off_body = off_case.group(1)
+        self.assertIn("log_snapshot_diag_throttled", off_body)
+        self.assertIn("return nullptr;", off_body)
+        self.assertLess(off_body.index("log_snapshot_diag_throttled"), off_body.index("return nullptr;"))
         self.assertLess(resolve.index("LuaMod::is_in_game_thread()"), resolve.index("ResolveServedSnapshotRoot"))
         self.assertEqual(source.count("UObjectGlobals::FindAllOf"), 1, "the UObjectArray scan must exist exactly once")
         self.assertIn("FindAllOf", resolve)
         self.assertLess(resolve.index("LuaMod::is_in_game_thread()"), resolve.index("FindAllOf"))
         # The only class scanned is the contract's native GameState class.
         self.assertIn('STR("MotorTownGameState")', resolve)
-        # The compiled decision is actually wired in (with the live thread flag).
-        self.assertIn("RecoverActiveSnapshotRoot<UObject>", resolve)
+        # The compiled decision is wired in with the ACTUAL sampled-once
+        # thread flag (review-3 P3: the previous literal true made the
+        # 'live thread flag' wording untrue).
+        self.assertRegex(resolve, r"RecoverActiveSnapshotRoot<UObject>\(\s*on_game_thread,")
 
     def test_snapshot_recovery_preserves_fail_closed_contract(self):
         # Named failure this catches: recovery must cache only through the
@@ -647,36 +887,50 @@ class SnapshotRegressionTests(unittest.TestCase):
         # typed 503 error when nothing resolvable exists. The served candidate
         # must pass through the same weak-cache gate as the cache path (never
         # a raw pointer that escapes weak resolution), the serve gate must
-        # re-read the authority backlink, and the current-world anchor must be
-        # wired from the LoadMap post callback.
+        # re-read the authority backlink, the lifecycle admission must be
+        # revalidated at the final decision point, and the current-world
+        # anchor must be wired from the LoadMap post callback.
         source = (ROOT / "src/snapshot.cpp").read_text()
         self.assertIn('"active MotorTownGameState is unavailable"', source)
         resolve = source.split("auto Store::resolve_active_game_state", 1)[1].split("auto Store::push_value", 1)[0]
-        self.assertIn("Store::set_active_game_state(", resolve)
+        self.assertIn("store_active_game_state_if_current(sampled, decision.admitted, tail.world)", resolve)
         self.assertNotIn("s_active_game_state =", resolve)
         self.assertEqual(source.count("serve_cached()"), 2, "cache gate before recovery and again before serving a recovered root")
         # The recovered raw pointer must never escape directly: the resolver's
         # final statement is the weak re-resolution itself (review-2 X4:
         # inserting 'return decision.admitted;' before the final serve gate
-        # kept every source-occurrence count green).
+        # kept every source-occurrence count green). The seam-level behavior
+        # (final-generation revalidation refusing store/return) is
+        # compiled-tested in the lifecycle seam test; this pins the wiring.
         self.assertNotIn("return decision.admitted", resolve)
-        self.assertTrue(
-            re.search(r"return serve_cached\(\);\s*\}\s*\Z", resolve),
-            "the resolver's final statement must be the serve_cached() weak re-resolution",
-        )
+        self.assertRegex(resolve, r"return serve_cached\(\);\s*\}\s*\Z")
+        # Admission revalidation wired at the final decision points (cache
+        # gate and mid-resolution inside the resolver; the atomic store's
+        # check lives in its own method).
+        self.assertGreaterEqual(resolve.count("AdmissionStillValid("), 2)
+        store_body = source.split("auto Store::store_active_game_state_if_current", 1)[1].split("auto Store::resolve_active_game_state", 1)[0]
+        self.assertIn("AdmissionStillValid(sampled, sample_lifecycle_state())", store_body)
+        self.assertIn("std::lock_guard guard{s_mutex};", store_body)
         # Serve-time backlink revalidation: the gate re-reads the authority
-        # chain through reflection instead of trusting registration time.
+        # chain through reflection instead of trusting registration time, and
+        # the recovery tail runs through the same seam family the tests
+        # execute.
         self.assertIn("ResolveServedSnapshotRoot", resolve)
+        self.assertIn("EvaluateRecoveredTail(", resolve)
         self.assertIn('STR("AuthorityGameMode")', resolve)
         self.assertIn('STR("GameState")', resolve)
-        self.assertIn("resolve_current_world()", resolve)
+        self.assertIn("sample_lifecycle_state()", resolve)
         # Pinned C++ completeness contract: recovery feeds the UWorld* returned
         # by UObject::GetWorld() to code that needs the complete type (the
-        # UObject* upcast into set_active_game_state, GetName). The pinned
+        # UObject* upcast into the cache registration, GetName). The pinned
         # overlay only forward-declares UWorld, so the explicit
         # <Unreal/World.hpp> include is required for the MSVC build.
         self.assertIn("#include <Unreal/World.hpp>", source)
-        # PendingKill gameplay-validity gate on every reflection read.
+        # The module's gameplay-readability predicate gates the objects that
+        # carry runtime state (recovery candidates, worlds, GameModes, the
+        # cached pair, array elements); metadata-only reads are disclosed as
+        # not individually gated in the snapshot.cpp comment, so the wording
+        # here stays scoped to the predicate itself.
         readable_body = source.split("auto object_is_readable", 1)[1].split("auto read_object_property", 1)[0]
         self.assertIn("HasAnyInternalFlags(EInternalObjectFlags::PendingKill)", readable_body)
         # Current-world anchor wiring in dllmain: the engine hands over its own

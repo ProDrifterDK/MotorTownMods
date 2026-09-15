@@ -203,45 +203,55 @@ MotorTownMods::MotorTownMods()
 
 auto MotorTownMods::on_unreal_init() -> void
 {
-	auto move_just_registered_to_front = [](auto& callbacks) {
-		// The pinned dispatcher (deps/first/Unreal/src/Hooks.cpp HookedLoadMap)
-		// runs pre callbacks, the original UEngine::LoadMap, then post
-		// callbacks, and BREAKS each loop at the first callback whose
-		// result.first is true; Hook::Register* APPENDS. Placing this mod's
-		// callbacks at the FRONT of both vectors makes the travel
-		// invalidation and the anchor refresh unconditional relative to any
-		// other API-registered callback: no earlier callback can end a loop
-		// before ours has run. Neither of ours returns a vetoing result.
-		if (callbacks.size() > 1) std::rotate(callbacks.begin(), callbacks.end() - 1, callbacks.end());
-	};
+	// Lifecycle notification boundary (review-3 P1): the pinned dispatcher
+	// (deps/first/Unreal/src/Hooks.cpp HookedLoadMap) breaks each callback
+	// loop at the first callback whose result.first is true, Register*
+	// appends, and nothing synchronizes registration with the live iteration
+	// of the dispatcher-owned LoadMap callback vectors. This module therefore
+	// registers normally and NEVER writes those vectors (an earlier pass
+	// rotated this mod's callback to the front of the live vectors;
+	// unsynchronized rotation of a dispatcher that may be iterating them can
+	// skip this mod's callback and run a peer's twice). Delivery is treated
+	// as delivered ONLY when it is delivered: if the pre callback below runs
+	// and the matching post never does, the Store stays unable to serve (null
+	// anchor, open travel interval) and every snapshot endpoint keeps
+	// answering the typed 503 with the anchor-specific diagnostic until a
+	// later delivered LoadMap refreshes the anchor (/status is unaffected and
+	// stays available). No dispatcher-side ordering, priority, or
+	// notification-coverage guarantee exists or is claimed; providing one
+	// would need a dispatcher-boundary mechanism outside the interruptible
+	// peer lists and is recorded as a design gap in the lane report.
 	Unreal::Hook::RegisterLoadMapPreCallback(
 		[](Unreal::UEngine*, Unreal::FWorldContext&, Unreal::FURL, Unreal::UPendingNetGame*, Unreal::FString&) -> std::pair<bool, bool> {
-			// Travel invalidation is unconditional: root cache and current-world
-			// anchor are dropped together before the engine starts loading, so
-			// no capture between this notification and the post notification can
-			// serve or recover the outgoing world's state. The anchor returns
-			// only when this mod's post callback delivers the new
-			// GetThisCurrentWorld(); if no post notification reaches this mod for
-			// that travel, the anchor stays null and every endpoint keeps
-			// refusing fail-closed (typed 503) with the throttled anchor-missing
-			// diagnostic.
+			// Travel invalidation, delivered-only: when THIS callback runs, the
+			// root cache and the current-world anchor drop together and the
+			// travel interval opens, so no capture between this notification
+			// and the matching post notification can serve or recover the
+			// outgoing world's state. The anchor returns only when this mod's
+			// post callback delivers the new GetThisCurrentWorld(); if no post
+			// notification reaches this mod for that travel, the store stays
+			// unable to serve (fail-closed typed 503, throttled
+			// anchor-missing diagnostic), never stale data. Returns
+			// {false, false}: this callback never vetoes, so it cannot end a
+			// peer's callback loop either.
 			MotorTown::Snapshot::Store::invalidate_travel_state();
 			return {false, false};
 		});
-	move_just_registered_to_front(Unreal::Hook::StaticStorage::LoadMapPreCallbacks);
-	// B1104 correction: engine-established current-world identity, captured at
-	// the only pinned moment it is handed to the mod. RegisterLoadMapPostCallback
-	// fires after UEngine::LoadMap returns, so FWorldContext::GetThisCurrentWorld()
-	// is the engine's own record of the world it just made current. Stored as a
-	// weak pointer and required by every snapshot serve/recovery path: when the
-	// LoadMap hook is disabled (bHookLoadMap=false silently skips detour
-	// installation) or the recorded world dies, the anchor is null/unresolvable
-	// and every endpoint refuses fail-closed instead of serving stale state.
-	// GetThisCurrentWorld() throws when the pinned engine version has no offset
-	// for it; that degrades to a null anchor, never to a guessed one.
-	// The refresh is unconditional: this callback is kept at the FRONT of the
-	// post vector (see above) and never vetoes, so no other API-registered post
-	// callback can prevent the anchor update for a travel whose post loop runs.
+	// B1104 correction: engine-established current-world identity, captured
+	// at the only pinned moment it is handed to the mod.
+	// RegisterLoadMapPostCallback fires after UEngine::LoadMap returns, so
+	// FWorldContext::GetThisCurrentWorld() is the engine's own record of the
+	// world it just made current. Stored as a weak pointer and required by
+	// every snapshot serve/recovery path: when the LoadMap hook is disabled
+	// (bHookLoadMap=false silently skips detour installation), the post
+	// callback is never delivered to this mod, or the recorded world dies,
+	// the anchor is null/unresolvable and every snapshot endpoint refuses
+	// fail-closed instead of serving stale state. GetThisCurrentWorld()
+	// throws when the pinned engine version has no offset for it; that
+	// degrades to a null anchor, never to a guessed one. The refresh closes
+	// exactly one open travel interval (Store bookkeeping), so a nested
+	// inner LoadMap's post cannot restore serve authority while an
+	// enclosing travel is still open.
 	Unreal::Hook::RegisterLoadMapPostCallback(
 		[](Unreal::UEngine*, Unreal::FWorldContext& world_context, Unreal::FURL, Unreal::UPendingNetGame*, Unreal::FString&) -> std::pair<bool, bool> {
 			Unreal::UWorld* current_world = nullptr;
@@ -256,7 +266,6 @@ auto MotorTownMods::on_unreal_init() -> void
 			MotorTown::Snapshot::Store::set_current_world(current_world);
 			return {false, false};
 		});
-	move_just_registered_to_front(Unreal::Hook::StaticStorage::LoadMapPostCallbacks);
 	Unreal::Hook::RegisterInitGameStatePostCallback([](Unreal::AGameModeBase* context) {
 		MotorTown::Snapshot::Store::clear_active_game_state();
 		// Run-17c RCA diagnostics: every early-return branch must be observable
