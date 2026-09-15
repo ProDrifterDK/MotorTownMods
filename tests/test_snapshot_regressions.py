@@ -739,9 +739,10 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertIn("InitGameStatePreCallbacks", dll)
         self.assertIn("InitGameStatePostCallbacks", dll)
         self.assertIn("InitGameStateDetour", dll)
-        # The boot line reports both LoadMap callback vector sizes, so the
-        # runtime probe can distinguish 'post callback registered' from
-        # 'detour never installed' (the current-world anchor source).
+        # The boot line reports both LoadMap vector sizes as registration
+        # counts (the current-world anchor's source). A count proves only that
+        # a callback is registered in the pinned dispatcher vector; it does not
+        # prove hook install or callback delivery.
         self.assertGreaterEqual(status.count("post_callbacks"), 2)
         snapshot = (ROOT / "src/snapshot.cpp").read_text()
         self.assertNotIn('ModStatics::LogOutput(L"[SnapshotDiag]', snapshot)
