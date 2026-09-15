@@ -59,15 +59,20 @@ auto RecoverActiveSnapshotRoot(bool on_game_thread, const void* current_world, S
 }
 
 // Cache-reuse gate. A cached pair is served only when:
-//   1. both weak pointers resolve (the pinned FWeakObjectPtr::Get rejects
-//      destroyed and PendingKill referents),
-//   2. the resolved root's world is the cached world,
-//   3. the cached world IS the engine's current world (identity compared as
+//   1. both weak pointers resolve. The pinned FWeakObjectPtr::Get default
+//      validity rejects null/stale-serial identities, Unreachable and
+//      PendingKill referents; it does NOT check RF_BeginDestroyed or
+//      RF_FinishDestroyed - those are this module's additional checks and
+//      are applied by is_readable in step 2,
+//   2. root and world pass the gameplay-readability gate BEFORE any engine
+//      virtual is called on them (UObject::GetWorld() below is an engine
+//      call, not a passive pointer comparison, so a pending-destroyed root
+//      is refused without being dereferenced into it),
+//   3. the resolved root's world is the cached world,
+//   4. the cached world IS the engine's current world (identity compared as
 //      const void* so an incomplete UWorld forward declaration compiles),
-//   4. root, world and the freshly re-read authority GameMode are all
-//      gameplay-readable (unreachable / PendingKill / pending-destroyed
-//      refuse), and
-//   5. that GameMode's live GameState still points back at the exact root,
+//   5. the freshly re-read authority GameMode is gameplay-readable, and
+//   6. that GameMode's live GameState still points back at the exact root,
 //      re-read through reflection at serve time rather than trusted from the
 //      moment of registration.
 // Anything else refuses: a stale, orphaned, ambiguous or dead root is never
@@ -78,11 +83,17 @@ auto ResolveServedSnapshotRoot(const WeakRoot& root, const WeakWorld& world, con
     auto* resolved_root = root.Get();
     auto* resolved_world = world.Get();
     if (!resolved_root || !resolved_world) return nullptr;
-    // Compare identity via void* so the check works even when UWorld is an
-    // incomplete forward-declared type in the including translation unit.
-    if (static_cast<const void*>(resolved_root->GetWorld()) != static_cast<const void*>(resolved_world)) return nullptr;
-    if (static_cast<const void*>(resolved_world) != current_world) return nullptr;
+    // Readability BEFORE engine state: weak resolution alone does not reject
+    // RF_BeginDestroyed/RF_FinishDestroyed, and GetWorld() is an engine
+    // virtual wrapper, so an otherwise-authoritative root with those flags
+    // must be refused before GetWorld() touches it.
     if (!is_readable(resolved_root) || !is_readable(resolved_world)) return nullptr;
+    // The anchor identity is checked before the root's GetWorld() so a stale
+    // anchor refuses without an engine call. Compare identity via void* so
+    // the check works even when UWorld is an incomplete forward-declared
+    // type in the including translation unit.
+    if (static_cast<const void*>(resolved_world) != current_world) return nullptr;
+    if (static_cast<const void*>(resolved_root->GetWorld()) != static_cast<const void*>(resolved_world)) return nullptr;
     auto* game_mode = authority_game_mode_of(resolved_world);
     if (!game_mode || !is_readable(game_mode)) return nullptr;
     if (game_state_of(game_mode) != resolved_root) return nullptr;

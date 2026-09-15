@@ -83,6 +83,12 @@ namespace MotorTown::Snapshot
         static auto cancel_all() -> void;
         static auto set_active_game_state(RC::Unreal::UObject* game_state, RC::Unreal::UObject* world) -> void;
         static auto clear_active_game_state() -> void;
+        // LoadMap pre notification: the outgoing world's cached root pair AND
+        // the current-world anchor are invalidated together under one lock, so
+        // no capture can observe the old pair as servable once a travel has
+        // begun. Until the matching post notification re-establishes the
+        // anchor, every serve and recovery refuses fail-closed.
+        static auto invalidate_travel_state() -> void;
         // Engine-established current-world identity, captured inside the
         // pinned overlay's LoadMap post callback (see dllmain.cpp). A null or
         // unresolvable anchor refuses every serve and recovery attempt.

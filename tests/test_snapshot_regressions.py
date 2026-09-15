@@ -234,11 +234,17 @@ class SnapshotRegressionTests(unittest.TestCase):
                     assert(decision.outcome == SnapshotRecoveryOutcome::Unresolved);
                     assert(decision.admitted == nullptr);
                 }
-                // Fully authoritative but PendingKill candidate: refused.
+                // Fully authoritative but PendingKill candidate: refused. The
+                // candidate IS the GameMode's live GameState here, so ONLY the
+                // readability gate rejects it (review-2 X1: an orphaned fixture
+                // is already rejected by the backlink, which proves nothing
+                // about readability).
                 {
                     GameState pending{&world, Flag::PendingKill};
+                    mode.game_state = &pending;
                     ScanSpy spy; spy.objects = {&pending};
                     assert(decide(true, &world, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                    mode.game_state = &live;
                 }
                 // PendingKill world on an otherwise complete chain: refused.
                 {
@@ -258,22 +264,39 @@ class SnapshotRegressionTests(unittest.TestCase):
                     ScanSpy spy; spy.objects = {&anchored};
                     assert(decide(true, &modeless, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
                 }
-                // Unreachable / pending-destroyed candidates: refused.
+                // Unreachable / pending-destroyed candidates: refused. Same
+                // fixture discipline: each is the GameMode's live GameState, so
+                // the backlink alone cannot reject it.
                 {
                     GameState gone{&world, Flag::Unreachable};
+                    mode.game_state = &gone;
                     ScanSpy spy; spy.objects = {&gone};
                     assert(decide(true, &world, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                    mode.game_state = &live;
                 }
                 {
                     GameState dying{&world, Flag::BeginDestroyed};
+                    mode.game_state = &dying;
                     ScanSpy spy; spy.objects = {&dying};
                     assert(decide(true, &world, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                    mode.game_state = &live;
                 }
                 // Orphan: readable, current world, but not the GameMode's live GameState.
                 {
                     GameState orphan{&world};
                     ScanSpy spy; spy.objects = {&orphan};
                     assert(decide(true, &world, spy).outcome == SnapshotRecoveryOutcome::Unresolved);
+                }
+                // Mixed-order list: an INVALID first candidate must not shadow
+                // a later valid one (review-2 X3: a recovery result of
+                // 'admitted ? candidates.front() : nullptr' stays green without
+                // this case).
+                {
+                    GameState bogus{&world}; // readable, current, but orphaned
+                    ScanSpy spy; spy.objects = {&bogus, &live};
+                    const auto decision = decide(true, &world, spy);
+                    assert(decision.outcome == SnapshotRecoveryOutcome::Recovered);
+                    assert(decision.admitted == &live);
                 }
                 // Two candidates that each pass the chain on successive backlink
                 // reads (models the authority property being re-pointed while the
@@ -305,26 +328,42 @@ class SnapshotRegressionTests(unittest.TestCase):
         # on (review-1: recover/cache old root, second authoritative world
         # appears, cache still returns the old root); (2) a cached root whose
         # authority backlink changed is still served unless the backlink is
-        # re-read at serve time; (3) an unreadable (PendingKill/unreachable)
-        # root, world or GameMode must refuse even when the pointer identity
-        # still matches; (4) dead weak pointers refuse.
+        # re-read at serve time; (3) an unreadable root, world or GameMode must
+        # refuse even when the pointer identity still matches; (4) dead weak
+        # pointers refuse; (5) a weak-resolvable, otherwise-authoritative
+        # pending-destroyed root refuses BEFORE the GetWorld engine virtual
+        # executes on it (review-2: pinned weak resolution does not check
+        # RF_BeginDestroyed/RF_FinishDestroyed - that is the module's gate, and
+        # it must run first).
         compiler = shutil.which("c++") or shutil.which("g++")
         if not compiler:
             self.skipTest("C++ compiler unavailable")
         source = textwrap.dedent(r"""
             #include "src/active_snapshot_root.h"
             #include <cassert>
-            enum class Flag { None, PendingKill, Unreachable };
+            enum class Flag { None, PendingKill, Unreachable, BeginDestroyed, FinishDestroyed };
             struct GameState;
             struct GameMode { GameState* game_state; Flag flag = Flag::None; };
             struct World { GameMode* game_mode; Flag flag = Flag::None; };
-            struct GameState { World* world; Flag flag = Flag::None; World* GetWorld() const { return world; } };
-            // Models the pinned FWeakObjectPtr::Get(): rejects destroyed and
-            // PendingKill referents, tolerates unreachable ones.
+            struct GameState {
+                World* world; Flag flag = Flag::None;
+                mutable int get_world_calls = 0; // engine-virtual access spy
+                World* GetWorld() const { ++get_world_calls; return world; }
+            };
+            // Models the pinned FWeakObjectPtr::Get() DEFAULT validity, verified
+            // against deps/first/Unreal (FWeakObjectPtr.cpp delegates to
+            // UObjectArray::IsValid; every located versioned container rejects
+            // Unreachable OR PendingKill): rejects null/stale-serial (modeled as
+            // null), Unreachable and PendingKill. RF_BeginDestroyed and
+            // RF_FinishDestroyed are NOT weak checks - the module's
+            // object_is_readable adds them, which is exactly what the
+            // BeginDestroyed/FinishDestroyed fixtures below isolate.
             template <typename T>
             struct Weak {
                 const T* value{};
-                const T* Get() const { return (value && value->flag != Flag::PendingKill) ? value : nullptr; }
+                const T* Get() const {
+                    return (value && value->flag != Flag::PendingKill && value->flag != Flag::Unreachable) ? value : nullptr;
+                }
             };
             int main() {
                 const auto readable = [](const auto* object) { return object && object->flag == Flag::None; };
@@ -342,8 +381,10 @@ class SnapshotRegressionTests(unittest.TestCase):
                 Weak<GameState> live_weak{&live};
                 Weak<World> world_weak{&world};
 
-                // Healthy pair anchored to the current world: served.
+                // Healthy pair anchored to the current world: served (and the
+                // engine virtual ran exactly once on a readable root).
                 assert(serve(live_weak, world_weak, &world) == &live);
+                assert(live.get_world_calls == 1);
                 // Cache reuse without an anchor refuses (identity unavailable).
                 assert(serve(live_weak, world_weak, nullptr) == nullptr);
                 // The current world moved on (second world became current):
@@ -375,12 +416,39 @@ class SnapshotRegressionTests(unittest.TestCase):
                 // Root or world gone (weak pointer unresolvable): refuse.
                 assert(serve(Weak<GameState>{}, world_weak, &world) == nullptr);
                 assert(serve(live_weak, Weak<World>{}, &world) == nullptr);
-                // PendingKill root: rejected by the weak resolution itself.
+                // PendingKill root: rejected by the pinned weak validity itself;
+                // GetWorld must not run on it.
                 {
                     GameState dying{&world, Flag::PendingKill};
                     assert(serve(Weak<GameState>{&dying}, world_weak, &world) == nullptr);
+                    assert(dying.get_world_calls == 0);
                 }
-                // Unreachable world: weak-resolvable but not gameplay-readable: refuse.
+                // Isolated weak-resolvable, otherwise-authoritative roots that
+                // only the module-added RF flags reject (review-2 X5): the serve
+                // gate must refuse BEFORE the GetWorld engine virtual executes.
+                {
+                    GameMode anchored_mode{nullptr};
+                    World anchored_world{&anchored_mode};
+                    GameState begin_destroyed{&anchored_world, Flag::BeginDestroyed};
+                    anchored_mode.game_state = &begin_destroyed;
+                    assert(serve(Weak<GameState>{&begin_destroyed}, Weak<World>{&anchored_world}, &anchored_world) == nullptr);
+                    assert(begin_destroyed.get_world_calls == 0);
+                }
+                {
+                    GameMode anchored_mode{nullptr};
+                    World anchored_world{&anchored_mode};
+                    GameState finish_destroyed{&anchored_world, Flag::FinishDestroyed};
+                    anchored_mode.game_state = &finish_destroyed;
+                    assert(serve(Weak<GameState>{&finish_destroyed}, Weak<World>{&anchored_world}, &anchored_world) == nullptr);
+                    assert(finish_destroyed.get_world_calls == 0);
+                }
+                // Unreachable root or world: the pinned weak validity itself
+                // rejects Unreachable; refuse at resolution, GetWorld not run.
+                {
+                    GameState gone{&world, Flag::Unreachable};
+                    assert(serve(Weak<GameState>{&gone}, world_weak, &world) == nullptr);
+                    assert(gone.get_world_calls == 0);
+                }
                 {
                     world.flag = Flag::Unreachable;
                     assert(serve(live_weak, world_weak, &world) == nullptr);
@@ -401,6 +469,145 @@ class SnapshotRegressionTests(unittest.TestCase):
             subprocess.run([compiler, "-std=c++17", "-I", str(ROOT), str(source_path), "-o", str(binary_path)], check=True)
             subprocess.run([str(binary_path)], check=True)
 
+    def test_loadmap_travel_invalidates_anchor_and_fails_closed_until_post(self):
+        # Named failure (review-2 P1): the LoadMap pre notification used to
+        # clear only the cached root pair, leaving s_current_world pointing at
+        # the OUTGOING world. In the pinned dispatcher (deps/first/Unreal/src/
+        # Hooks.cpp HookedLoadMap) the post-callback loop breaks at the first
+        # callback returning {true, _} and Register* appends, so an earlier
+        # post callback can skip this mod's anchor refresh for that travel.
+        # While the stale anchor stayed live, recovery re-admitted the old
+        # world's root and the serve gate accepted it (cached world == stale
+        # anchor). The fix invalidates cache AND anchor together inside the
+        # pre notification and keeps both callbacks at the FRONT of their
+        # vectors; a skipped post leaves a permanent typed 503 with the
+        # throttled anchor-missing diagnostic instead of stale state.
+        # The compiled half executes the real production gate/recovery logic
+        # over the pre/capture/post event sequence; the source half pins the
+        # Store and dllmain wiring that feeds it.
+        compiler = shutil.which("c++") or shutil.which("g++")
+        if compiler:
+            source = textwrap.dedent(r"""
+                #include "src/active_snapshot_root.h"
+                #include <cassert>
+                #include <vector>
+                enum class Flag { None, PendingKill, Unreachable };
+                struct GameState;
+                struct GameMode { GameState* game_state; Flag flag = Flag::None; };
+                struct World { GameMode* game_mode; Flag flag = Flag::None; };
+                struct GameState { World* world; Flag flag = Flag::None; World* GetWorld() const { return world; } };
+                struct ScanSpy {
+                    int invocations = 0;
+                    std::vector<GameState*> objects;
+                    std::vector<GameState*> operator()() { ++invocations; return objects; }
+                };
+                template <typename T>
+                struct Weak {
+                    const T* value{};
+                    const T* Get() const {
+                        return (value && value->flag != Flag::PendingKill && value->flag != Flag::Unreachable) ? value : nullptr;
+                    }
+                };
+                int main() {
+                    const auto readable = [](const auto* object) { return object && object->flag == Flag::None; };
+                    const auto world_of = [](GameState* game_state) { return game_state->world; };
+                    const auto mode_of = [](const World* world) { return world->game_mode; };
+                    const auto state_of = [](const GameMode* game_mode) { return game_mode->game_state; };
+
+                    GameMode old_mode{nullptr};
+                    World old_world{&old_mode};
+                    GameState stale{&old_world};
+                    old_mode.game_state = &stale;
+                    Weak<GameState> stale_weak{&stale};
+                    Weak<World> old_world_weak{&old_world};
+
+                    // (1) The reviewed defect's mechanism, kept as contrast: if
+                    // pre left the OLD anchor live (only the cache cleared), a
+                    // capture during the travel window re-admits the old root.
+                    {
+                        ScanSpy spy; spy.objects = {&stale};
+                        const auto decision = RecoverActiveSnapshotRoot<GameState>(true, &old_world, spy, readable, world_of, mode_of, state_of);
+                        assert(decision.outcome == SnapshotRecoveryOutcome::Recovered);
+                        assert(decision.admitted == &stale);
+                    }
+                    // (2) Fixed behavior: pre invalidated cache AND anchor, so
+                    // the same capture between pre and post refuses BEFORE the
+                    // scan and the serve gate refuses the (cleared) cache too.
+                    {
+                        ScanSpy spy; spy.objects = {&stale};
+                        const auto decision = RecoverActiveSnapshotRoot<GameState>(true, nullptr, spy, readable, world_of, mode_of, state_of);
+                        assert(decision.outcome == SnapshotRecoveryOutcome::NoCurrentWorld);
+                        assert(decision.admitted == nullptr);
+                        assert(spy.invocations == 0);
+                        assert(ResolveServedSnapshotRoot(stale_weak, old_world_weak, nullptr, readable, mode_of, state_of) == nullptr);
+                    }
+                    // (3) Post notification skipped: the anchor never returns;
+                    // later captures still refuse. Permanent typed 503 beats
+                    // serving stale state.
+                    {
+                        ScanSpy spy; spy.objects = {&stale};
+                        const auto decision = RecoverActiveSnapshotRoot<GameState>(true, nullptr, spy, readable, world_of, mode_of, state_of);
+                        assert(decision.outcome == SnapshotRecoveryOutcome::NoCurrentWorld);
+                        assert(ResolveServedSnapshotRoot(stale_weak, old_world_weak, nullptr, readable, mode_of, state_of) == nullptr);
+                    }
+                    // (4) Post notification delivered: anchor = new world. The
+                    // old pair refuses (anchor moved on); the new world's root
+                    // is admitted through the chain and serves once cached.
+                    {
+                        GameMode new_mode{nullptr};
+                        World new_world{&new_mode};
+                        GameState fresh{&new_world};
+                        new_mode.game_state = &fresh;
+                        ScanSpy spy; spy.objects = {&fresh};
+                        const auto decision = RecoverActiveSnapshotRoot<GameState>(true, &new_world, spy, readable, world_of, mode_of, state_of);
+                        assert(decision.outcome == SnapshotRecoveryOutcome::Recovered);
+                        assert(decision.admitted == &fresh);
+                        Weak<GameState> fresh_weak{&fresh};
+                        Weak<World> new_world_weak{&new_world};
+                        assert(ResolveServedSnapshotRoot(fresh_weak, new_world_weak, &new_world, readable, mode_of, state_of) == &fresh);
+                        assert(ResolveServedSnapshotRoot(stale_weak, old_world_weak, &new_world, readable, mode_of, state_of) == nullptr);
+                    }
+                }
+            """)
+            with tempfile.TemporaryDirectory() as directory:
+                source_path = Path(directory) / "travel.cpp"
+                binary_path = Path(directory) / "travel"
+                source_path.write_text(source)
+                subprocess.run(
+                    [compiler, "-std=c++17", "-I", str(ROOT), str(source_path), "-o", str(binary_path)],
+                    check=True,
+                )
+                subprocess.run([str(binary_path)], check=True)
+        else:
+            self.skipTest("C++ compiler unavailable")
+
+        # Store wiring: one lock, all three travel-derived pointers dropped.
+        source = (ROOT / "src/snapshot.cpp").read_text()
+        invalidate_body = source.split("auto Store::invalidate_travel_state", 1)[1].split("auto Store::set_current_world", 1)[0]
+        self.assertIn("s_active_game_state = nullptr;", invalidate_body)
+        self.assertIn("s_active_world = nullptr;", invalidate_body)
+        self.assertIn("s_current_world = nullptr;", invalidate_body)
+        # The anchor-missing refusal is observable at a level <= Normal.
+        self.assertIn('L"anchor-missing"', source)
+
+        # dllmain wiring: the PRE notification invalidates travel state (not
+        # merely the root cache), the POST notification refreshes the anchor,
+        # and each just-registered callback is moved to the FRONT of its
+        # pinned dispatcher vector so no earlier-registered peer can end the
+        # interruptible loop before ours has run.
+        dll = (ROOT / "src/dllmain.cpp").read_text()
+        pre_body = dll.split("RegisterLoadMapPreCallback(", 1)[1].split("RegisterLoadMapPostCallback(", 1)[0]
+        self.assertIn("Store::invalidate_travel_state()", pre_body)
+        self.assertNotIn("clear_active_game_state", pre_body)
+        post_body = dll.split("RegisterLoadMapPostCallback(", 1)[1].split("RegisterInitGameStatePostCallback", 1)[0]
+        self.assertIn("Store::set_current_world(", post_body)
+        pre_rotate = "move_just_registered_to_front(Unreal::Hook::StaticStorage::LoadMapPreCallbacks)"
+        post_rotate = "move_just_registered_to_front(Unreal::Hook::StaticStorage::LoadMapPostCallbacks)"
+        self.assertIn(pre_rotate, dll)
+        self.assertIn(post_rotate, dll)
+        self.assertLess(dll.index("RegisterLoadMapPreCallback("), dll.index(pre_rotate))
+        self.assertLess(dll.index("RegisterLoadMapPostCallback("), dll.index(post_rotate))
+
     def test_snapshot_recovery_runs_only_on_authorized_game_thread(self):
         # Named failure this catches: the recovery path scans the global
         # UObjectArray (FindAllOf). If that scan can run from the HTTP worker
@@ -415,6 +622,15 @@ class SnapshotRegressionTests(unittest.TestCase):
         source = (ROOT / "src/snapshot.cpp").read_text()
         resolve = source.split("auto Store::resolve_active_game_state", 1)[1].split("auto Store::push_value", 1)[0]
         self.assertIn("LuaMod::is_in_game_thread()", resolve)
+        # The refusal must live INSIDE the guard's braced body (review-2 X2:
+        # deleting only the guard's 'return nullptr' kept the suite green when
+        # merely the guard text and its order were checked).
+        guard = re.search(r"if \(!LuaMod::is_in_game_thread\(\)\)\s*\{([^{}]*)\}", resolve)
+        self.assertTrue(guard, "the off-thread refusal must be a braced guard block")
+        guard_body = guard.group(1)
+        self.assertIn("log_snapshot_diag_throttled", guard_body)
+        self.assertIn("return nullptr;", guard_body)
+        self.assertLess(guard_body.index("log_snapshot_diag_throttled"), guard_body.index("return nullptr;"))
         self.assertLess(resolve.index("LuaMod::is_in_game_thread()"), resolve.index("ResolveServedSnapshotRoot"))
         self.assertEqual(source.count("UObjectGlobals::FindAllOf"), 1, "the UObjectArray scan must exist exactly once")
         self.assertIn("FindAllOf", resolve)
@@ -438,6 +654,15 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertIn("Store::set_active_game_state(", resolve)
         self.assertNotIn("s_active_game_state =", resolve)
         self.assertEqual(source.count("serve_cached()"), 2, "cache gate before recovery and again before serving a recovered root")
+        # The recovered raw pointer must never escape directly: the resolver's
+        # final statement is the weak re-resolution itself (review-2 X4:
+        # inserting 'return decision.admitted;' before the final serve gate
+        # kept every source-occurrence count green).
+        self.assertNotIn("return decision.admitted", resolve)
+        self.assertTrue(
+            re.search(r"return serve_cached\(\);\s*\}\s*\Z", resolve),
+            "the resolver's final statement must be the serve_cached() weak re-resolution",
+        )
         # Serve-time backlink revalidation: the gate re-reads the authority
         # chain through reflection instead of trusting registration time.
         self.assertIn("ResolveServedSnapshotRoot", resolve)

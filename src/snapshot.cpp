@@ -628,6 +628,26 @@ namespace MotorTown::Snapshot
         s_active_world = nullptr;
     }
 
+    auto Store::invalidate_travel_state() -> void
+    {
+        // LoadMap pre notification (dllmain.cpp): the outgoing world's root
+        // cache and the current-world anchor are dropped together, under the
+        // same lock, the moment the engine announces a travel. Recovery is
+        // anchored to s_current_world, so letting the old anchor stay live
+        // here would let recovery re-admit the old world's root during the
+        // travel window and let the serve gate accept it (cached world ==
+        // stale anchor). If the matching post notification never reaches
+        // this mod (the pinned dispatcher's post loop is interruptible by an
+        // earlier post callback returning {true, _}), the anchor stays null
+        // and every endpoint keeps refusing fail-closed with the typed 503;
+        // the throttled anchor-missing diagnostic below makes that state
+        // observable in UE4SS.log.
+        std::lock_guard guard{s_mutex};
+        s_active_game_state = nullptr;
+        s_active_world = nullptr;
+        s_current_world = nullptr;
+    }
+
     auto Store::set_current_world(UObject* world) -> void
     {
         std::lock_guard guard{s_mutex};
@@ -637,9 +657,13 @@ namespace MotorTown::Snapshot
     auto Store::resolve_current_world() -> UObject*
     {
         std::lock_guard guard{s_mutex};
-        // FWeakObjectPtr::Get rejects destroyed and PendingKill referents, so
-        // an engine-current world that since died refuses here instead of
-        // serving as a stale identity anchor.
+        // Pinned FWeakObjectPtr::Get default validity (verified against
+        // deps/first/Unreal/src/FWeakObjectPtr.cpp + UObjectArray.cpp):
+        // rejects null/stale-serial identities, Unreachable and PendingKill
+        // referents. RF_BeginDestroyed/RF_FinishDestroyed are NOT weak
+        // checks; this module rejects those separately in object_is_readable.
+        // A dead anchor therefore refuses here instead of serving as a stale
+        // identity anchor.
         return s_current_world.Get();
     }
 
@@ -682,8 +706,12 @@ namespace MotorTown::Snapshot
 
         if (!current_world)
         {
-            log_snapshot_diag_throttled(L"no-current-world",
-                L"active root unavailable: no current-world identity (LoadMap hook inactive or anchor unresolved)");
+            // Anchor-specific, observable at LogLevel::Normal: a missing
+            // anchor is exactly the state a travel sits in between the pre
+            // invalidation and the post refresh, and permanently so when the
+            // post notification is skipped. Fail closed, never serve stale.
+            log_snapshot_diag_throttled(L"anchor-missing",
+                L"active root unavailable: current-world anchor missing (LoadMap pre cleared it; post notification not yet delivered, skipped by an earlier post callback, or LoadMap hook inactive)");
             return nullptr;
         }
 
@@ -718,16 +746,34 @@ namespace MotorTown::Snapshot
                 break;
         }
 
+        // Same ordering discipline as the serve gate: GetWorld/GetName are
+        // engine virtuals, so the recovered root and its world pass a fresh
+        // gameplay-readability check BEFORE either is called. A root that
+        // became unreachable between the scan and here is refused without
+        // being dereferenced into engine code.
+        if (!object_is_readable(decision.admitted))
+        {
+            log_snapshot_diag_throttled(L"recovered-unreadable",
+                L"active root recovery aborted: recovered root became unreadable before caching");
+            return nullptr;
+        }
         auto* world = decision.admitted->GetWorld();
+        if (!world || !object_is_readable(world))
+        {
+            log_snapshot_diag_throttled(L"recovered-unreadable",
+                L"active root recovery aborted: recovered root's world is missing or unreadable before caching");
+            return nullptr;
+        }
         Store::set_active_game_state(decision.admitted, world);
         log_snapshot_diag_throttled(L"recovered",
             std::wstring{L"active root recovered on demand (game_state="} + decision.admitted->GetName() +
             L" world=" + world->GetName() + L")");
         // Never return a pointer the stored weak root/world cannot resolve:
         // the recovered candidate is served through the exact same weak-cache
-        // gate as every other path, and a late GC/PendingKill race refuses.
-        if (auto* served = serve_cached()) return served;
-        return nullptr;
+        // gate as every other path (final weak re-resolution), and a late
+        // GC/PendingKill race refuses there. The recovered raw pointer never
+        // escapes this function directly.
+        return serve_cached();
     }
 
     auto Store::push_value(const LuaMadeSimple::Lua& lua, const Value& value) -> void
