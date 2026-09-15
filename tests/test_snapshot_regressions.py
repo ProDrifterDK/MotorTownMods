@@ -178,6 +178,120 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertIn("if not socket then return true end", callback)
         self.assertLess(callback.index("if not socket then return true end"), callback.index("socket.gettime()"))
 
+    def test_recovered_root_selection_fails_closed_and_prefers_newest_world_anchored_candidate(self):
+        # Named failure this catches: the on-demand recovery path must never
+        # cache a candidate that is unreadable (pending destruction) or not
+        # anchored to a live world, and must prefer the newest admissible
+        # candidate so a post-travel stale MotorTownGameState is not served to
+        # HTTP clients. A violated gate here returns freed or stale engine
+        # objects as if they were live data (fabricated/partial snapshots).
+        compiler = shutil.which("c++") or shutil.which("g++")
+        if not compiler:
+            self.skipTest("C++ compiler unavailable")
+        source = textwrap.dedent(r"""
+            #include "src/active_snapshot_root.h"
+            #include <cassert>
+            #include <vector>
+            struct World {};
+            struct Candidate { World* world; bool readable; };
+            int main() {
+                World old_world, new_world;
+                const Candidate stale{&old_world, true};
+                const Candidate fresh{&new_world, true};
+                const Candidate destroyed{&new_world, false};
+                const Candidate unanchored{nullptr, true};
+                const auto readable = [](const Candidate* c) { return c->readable; };
+                const auto world_of = [](const Candidate* c) { return c->world; };
+                using Candidates = std::vector<const Candidate*>;
+                // Empty scan (UObjectArray has no such class yet): fail closed.
+                assert(SelectRecoveredSnapshotRoot(Candidates{}, readable, world_of) == nullptr);
+                // Unreadable (pending-destroy) candidates are refused.
+                assert(SelectRecoveredSnapshotRoot(Candidates{&destroyed}, readable, world_of) == nullptr);
+                // Candidates not anchored to a live world are refused.
+                assert(SelectRecoveredSnapshotRoot(Candidates{&unanchored}, readable, world_of) == nullptr);
+                // Newest admissible candidate wins; an unreadable newer entry
+                // must not hide an older admissible one behind it.
+                assert(SelectRecoveredSnapshotRoot(Candidates{&stale, &destroyed, &fresh}, readable, world_of) == &fresh);
+                // When nothing newer is admissible, an older readable anchored
+                // candidate is still accepted (it is real live state).
+                assert(SelectRecoveredSnapshotRoot(Candidates{&stale, &unanchored}, readable, world_of) == &stale);
+                // Selection is positional: the last element is treated as the
+                // newest (UObjectArray allocation order).
+                assert(SelectRecoveredSnapshotRoot(Candidates{&fresh, &stale}, readable, world_of) == &stale);
+            }
+        """)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "recovered.cpp"
+            binary_path = Path(directory) / "recovered"
+            source_path.write_text(source)
+            subprocess.run(
+                [compiler, "-std=c++20", "-I", str(ROOT), str(source_path), "-o", str(binary_path)],
+                check=True,
+            )
+            subprocess.run([str(binary_path)], check=True)
+
+    def test_snapshot_recovery_runs_only_on_authorized_game_thread(self):
+        # Named failure this catches: the recovery path scans the global
+        # UObjectArray (FindAllOf). If that scan can run from the HTTP worker
+        # thread, it races the game thread's object mutations exactly like the
+        # Run-13 D2 defect class; the guard must come before any scan and
+        # refuse off-thread captures fail-closed.
+        source = (ROOT / "src/snapshot.cpp").read_text()
+        recovery = source.split("auto recover_active_game_state", 1)[1].split("auto Store::begin", 1)[0]
+        self.assertIn("is_in_game_thread()", recovery)
+        self.assertLess(recovery.index("is_in_game_thread()"), recovery.index("FindAllOf"))
+        self.assertIn("FindAllOf", recovery)
+        # The only class scanned is the contract's native GameState class.
+        self.assertIn('STR("MotorTownGameState")', recovery)
+
+    def test_snapshot_recovery_preserves_fail_closed_contract(self):
+        # Named failure this catches: recovery must cache only through the
+        # Store's world-identity-checked registration and must still refuse
+        # with the typed 503 error when nothing resolvable exists. Removing
+        # either would return fabricated or partial data instead of failing
+        # closed.
+        source = (ROOT / "src/snapshot.cpp").read_text()
+        self.assertIn('"active MotorTownGameState is unavailable"', source)
+        recovery = source.split("auto recover_active_game_state", 1)[1].split("auto Store::begin", 1)[0]
+        self.assertIn("Store::set_active_game_state(", recovery)
+        self.assertNotIn("s_active_game_state =", recovery)
+        resolve = source.split("auto Store::resolve_active_game_state", 1)[1].split("auto Store::push_value", 1)[0]
+        self.assertIn("ResolveActiveSnapshotRoot", resolve)
+        self.assertIn("recover_active_game_state()", resolve)
+        # The cached-root fast path must stay first: recovery runs only when
+        # the cache is missing or stale (failure path), never per request.
+        self.assertLess(resolve.index("ResolveActiveSnapshotRoot"), resolve.index("recover_active_game_state()"))
+
+    def test_lifecycle_diagnostics_survive_canary_log_level(self):
+        # Named failure this catches: [SnapshotDiag] lines emitted with the
+        # default LogLevel::Default template argument are suppressed at the
+        # frozen canary level (MOD_SERVER_LOG_LEVEL=2), which is why 18 canary
+        # runs produced zero [SnapshotDiag] evidence. Every lifecycle
+        # registration/resolution diagnostic must pin an explicit level of
+        # Normal or stronger, and the boot line must carry detour-install
+        # evidence so 'never installed' and 'installed but never fired' are
+        # distinguishable.
+        dll = (ROOT / "src/dllmain.cpp").read_text()
+        self.assertNotIn('ModStatics::LogOutput(L"[SnapshotDiag]', dll)
+        for line in [segment for segment in dll.splitlines() if "[SnapshotDiag]" in segment and "LogOutput" in segment]:
+            self.assertTrue(
+                "LogOutput<LogLevel::Normal>" in line or "LogOutput<LogLevel::Warning>" in line,
+                f"SnapshotDiag line lacks explicit level <= Normal: {line.strip()}",
+            )
+        status = dll.split("[SnapshotDiag] lifecycle hook status", 1)[1]
+        self.assertIn("signature_ready", status)
+        self.assertIn("signature_address", status)
+        self.assertIn("detour_installed", status)
+        self.assertIn("InitGameStateDetour", dll)
+        self.assertIn("InitGameStatePostCallbacks", dll)
+        snapshot = (ROOT / "src/snapshot.cpp").read_text()
+        self.assertNotIn('ModStatics::LogOutput(L"[SnapshotDiag]', snapshot)
+        for line in [segment for segment in snapshot.splitlines() if "[SnapshotDiag]" in segment and "LogOutput" in segment]:
+            self.assertTrue(
+                "LogOutput<LogLevel::Normal>" in line or "LogOutput<LogLevel::Warning>" in line,
+                f"SnapshotDiag line lacks explicit level <= Normal: {line.strip()}",
+            )
+
     def test_b1104_contract_is_distinct_and_runtime_pending(self):
         b1088 = json.loads((ROOT / "compatibility/motortown-0.7.19-b1088.json").read_text())
         b1104 = json.loads((ROOT / "compatibility/motortown-0.7.19-b1104.json").read_text())

@@ -210,9 +210,11 @@ auto MotorTownMods::on_unreal_init() -> void
 		// in UE4SS.log; the snapshot capture path otherwise fails closed with a
 		// generic 'active MotorTownGameState is unavailable' that cannot
 		// distinguish a missing registration from a world-identity mismatch.
+		// LogLevel::Warning is pinned explicitly so the evidence survives
+		// MOD_SERVER_LOG_LEVEL=2 canaries (Default=3 is suppressed there).
 		if (!context)
 		{
-			ModStatics::LogOutput(L"[SnapshotDiag] InitGameState post: context is null; active root cleared");
+			ModStatics::LogOutput<LogLevel::Warning>(L"[SnapshotDiag] InitGameState post: context is null; active root cleared");
 			return;
 		}
 		auto* game_state_property = context->GetPropertyByNameInChain(STR("GameState"));
@@ -221,7 +223,7 @@ auto MotorTownMods::on_unreal_init() -> void
 			const std::wstring class_name = context->GetClassPrivate()
 				? context->GetClassPrivate()->GetFullName()
 				: std::wstring{STR("<null>")};
-			ModStatics::LogOutput(L"[SnapshotDiag] InitGameState post: GameState property missing or not FObjectProperty on GameMode class {}",
+			ModStatics::LogOutput<LogLevel::Warning>(L"[SnapshotDiag] InitGameState post: GameState property missing or not FObjectProperty on GameMode class {}",
 				class_name);
 			return;
 		}
@@ -233,17 +235,41 @@ auto MotorTownMods::on_unreal_init() -> void
 			const std::wstring game_state_state = game_state ? STR("present") : STR("null");
 			const std::wstring world_state = world ? STR("present") : STR("null");
 			const std::wstring world_match = (game_state && world && game_state->GetWorld() == world) ? STR("true") : STR("false");
-			ModStatics::LogOutput(L"[SnapshotDiag] InitGameState post: invalid root (game_state={} world={} world_match={})",
+			ModStatics::LogOutput<LogLevel::Warning>(L"[SnapshotDiag] InitGameState post: invalid root (game_state={} world={} world_match={})",
 				game_state_state,
 				world_state,
 				world_match);
 			return;
 		}
 		MotorTown::Snapshot::Store::set_active_game_state(game_state, world);
-		ModStatics::LogOutput(L"[SnapshotDiag] InitGameState post: active root registered (game_state={} world={})",
+		ModStatics::LogOutput<LogLevel::Normal>(L"[SnapshotDiag] InitGameState post: active root registered (game_state={} world={})",
 			game_state->GetName(),
 			world->GetName());
 	});
+
+	// B1104 dedicated 503 RCA discriminator: one-shot boot evidence for WHY the
+	// InitGameState callback can (or cannot) ever fire. RegisterInitGameStatePostCallback
+	// installs the detour synchronously when hooking is enabled, so reading the
+	// detour pointer right after registration distinguishes:
+	//   detour_installed=false -> the callback can never fire (config
+	//     Hooks.HookInitGameState disabled, or the InitGameState signature was
+	//     never resolved; signature_ready/signature_address tell which).
+	//   detour_installed=true  -> installed; if no '[SnapshotDiag] InitGameState
+	//     post:' line ever follows, the dedicated boot never calls
+	//     AGameModeBase::InitGameState (or an override skips Super).
+	// Pinned to LogLevel::Warning so it survives MOD_SERVER_LOG_LEVEL=2.
+	const bool lifecycle_loadmap_detour_installed = Unreal::Hook::StaticStorage::LoadMapDetour != nullptr;
+	const bool lifecycle_signature_ready = Unreal::AGameModeBase::InitGameStateInternal.is_ready();
+	const uint64_t lifecycle_signature_address = lifecycle_signature_ready ? reinterpret_cast<uint64_t>(Unreal::AGameModeBase::InitGameStateInternal.get_function_address()) : 0;
+	const bool lifecycle_initgamestate_detour_installed = Unreal::Hook::StaticStorage::InitGameStateDetour != nullptr;
+	const size_t lifecycle_initgamestate_post_callbacks = Unreal::Hook::StaticStorage::InitGameStatePostCallbacks.size();
+	ModStatics::LogOutput<LogLevel::Warning>(
+		L"[SnapshotDiag] lifecycle hook status: loadmap_detour_installed={} initgamestate signature_ready={} signature_address={:#x} detour_installed={} post_callbacks={} (detour_installed=false means the InitGameState callback can never fire)",
+		lifecycle_loadmap_detour_installed,
+		lifecycle_signature_ready,
+		lifecycle_signature_address,
+		lifecycle_initgamestate_detour_installed,
+		lifecycle_initgamestate_post_callbacks);
 
 	// Init API server
 	auto server = Webserver::Get();

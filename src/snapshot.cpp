@@ -1,11 +1,15 @@
 #include "snapshot.h"
 #include "active_snapshot_root.h"
 
+#include <Mod/LuaMod.hpp>
+#include <Unreal/UObjectGlobals.hpp>
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
+#include "statics.h"
 #include <Unreal/UObject.hpp>
 #include <Unreal/UClass.hpp>
 #include <Unreal/UnrealFlags.hpp>
@@ -99,6 +103,57 @@ namespace MotorTown::Snapshot
         {
             return object && !object->IsUnreachable() &&
                    !object->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed));
+        }
+
+        auto log_snapshot_diag_throttled(std::wstring key, std::wstring message) -> void
+        {
+            // Failure-path diagnostics only: repeats are throttled so a polled
+            // endpoint cannot flood UE4SS.log, while the first occurrence of a
+            // state stays visible. LogLevel::Normal is pinned explicitly so
+            // the evidence survives MOD_SERVER_LOG_LEVEL=2 (the frozen canary
+            // level suppresses the LogLevel::Default template argument).
+            static std::mutex diag_mutex{};
+            static std::map<std::wstring, std::chrono::steady_clock::time_point> last_emitted{};
+            {
+                std::lock_guard guard{diag_mutex};
+                const auto now = std::chrono::steady_clock::now();
+                auto found = last_emitted.find(key);
+                if (found != last_emitted.end() && now - found->second < std::chrono::seconds{30}) return;
+                last_emitted[key] = now;
+            }
+            ModStatics::LogOutput<LogLevel::Normal>(L"[SnapshotDiag] {}", message);
+        }
+
+        auto recover_active_game_state() -> UObject*
+        {
+            // resolve_active_game_state is reached only from capture_query,
+            // which runs inside the authorized GameThread capture binding.
+            // The UObjectArray scan below must never cross threads: refuse
+            // every other context fail-closed (Run-13 D2 defect class).
+            if (!LuaMod::is_in_game_thread())
+            {
+                log_snapshot_diag_throttled(L"off-thread", L"active root recovery refused: not on the GameThread");
+                return nullptr;
+            }
+            std::vector<UObject*> candidates;
+            Unreal::UObjectGlobals::FindAllOf(STR("MotorTownGameState"), candidates);
+            auto* recovered = SelectRecoveredSnapshotRoot(
+                candidates,
+                [](UObject* object) { return object_is_readable(object); },
+                [](UObject* object) { return object->GetWorld(); });
+            if (recovered)
+            {
+                auto* world = recovered->GetWorld();
+                Store::set_active_game_state(recovered, world);
+                log_snapshot_diag_throttled(L"recovered",
+                    std::wstring{L"active root recovered on demand (game_state="} + recovered->GetName() +
+                    L" world=" + world->GetName() + L")");
+                return recovered;
+            }
+            log_snapshot_diag_throttled(L"unresolved",
+                std::wstring{L"active root recovery failed: no readable MotorTownGameState anchored to a live world (candidates="} +
+                std::to_wstring(candidates.size()) + L")");
+            return nullptr;
         }
 
         auto object_reference(UObject* object, Budget& budget) -> Value
@@ -587,8 +642,17 @@ namespace MotorTown::Snapshot
 
     auto Store::resolve_active_game_state() -> UObject*
     {
-        std::lock_guard guard{s_mutex};
-        return ResolveActiveSnapshotRoot(s_active_game_state, s_active_world);
+        {
+            std::lock_guard guard{s_mutex};
+            if (auto* cached = ResolveActiveSnapshotRoot(s_active_game_state, s_active_world))
+            {
+                return cached;
+            }
+        }
+        // Cached root missing or stale (the InitGameState lifecycle hook never
+        // fired on this boot, or the world traveled): resolve the current game
+        // state on demand on the GameThread instead of failing closed forever.
+        return recover_active_game_state();
     }
 
     auto Store::push_value(const LuaMadeSimple::Lua& lua, const Value& value) -> void
