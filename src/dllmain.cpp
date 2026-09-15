@@ -221,9 +221,10 @@ auto MotorTownMods::on_unreal_init() -> void
 			// no capture between this notification and the post notification can
 			// serve or recover the outgoing world's state. The anchor returns
 			// only when this mod's post callback delivers the new
-			// GetThisCurrentWorld(); if that post notification is skipped, the
-			// anchor stays null and every endpoint keeps refusing fail-closed
-			// (typed 503) with the throttled anchor-missing diagnostic.
+			// GetThisCurrentWorld(); if no post notification reaches this mod for
+			// that travel, the anchor stays null and every endpoint keeps
+			// refusing fail-closed (typed 503) with the throttled anchor-missing
+			// diagnostic.
 			MotorTown::Snapshot::Store::invalidate_travel_state();
 			return {false, false};
 		});
@@ -299,27 +300,27 @@ auto MotorTownMods::on_unreal_init() -> void
 			world->GetName());
 	});
 
-	// B1104 dedicated 503 RCA discriminator: one-shot boot evidence for WHY the
-	// InitGameState callback can (or cannot) ever fire. In the pinned overlay
-	// (0a7434d / deps/first/Unreal 121f2ff) Register*Callback only attempts the
-	// hook when GlobalConfig.bHook* is set, and HookInitGameState() assigns the
-	// detour object BEFORE calling PLH::hook() and discards hook()'s result.
-	// Therefore the one-shot line reports:
-	//   hook_configured=false -> the callback is registered but the detour is
-	//     never attempted; it can never fire.
-	//   detour_object_present=false with hook_configured=true -> the InitGameState
-	//     signature was never resolved (signature_ready/signature_address tell
-	//     which), so nothing was hooked.
-	//   detour_object_present=true -> a detour object was created; if no
-	//     '[SnapshotDiag] InitGameState post:' line ever follows, the dedicated
-	//     boot never calls AGameModeBase::InitGameState (or an override skips
-	//     Super::InitGameState). Pointer presence does NOT prove install
-	//     success: the overlay's hook wrappers assign the object before
-	//     calling PLH::hook() and discard hook()'s result. The PolyHook
-	//     dependency is not materialized in this checkout (deps/third/
-	//     PolyHook_2_0 holds only its CMakeLists), so no install-state query
-	//     (e.g. PLH::IHook::isHooked) could be verified for use here.
-	// Pinned to LogLevel::Warning so it survives MOD_SERVER_LOG_LEVEL=2.
+	// B1104 dedicated 503 RCA discriminator: one-shot boot evidence for the
+	// lifecycle-hook preconditions that decide whether the InitGameState
+	// callback can ever fire. In the pinned overlay (0a7434d / deps/first/
+	// Unreal 121f2ff) Register*Callback only attempts the hook when
+	// GlobalConfig.bHook* is set, and HookInitGameState()/HookLoadMap() assign
+	// the detour object BEFORE calling PLH::hook() and discard hook()'s
+	// result. Each field therefore proves exactly one thing:
+	//   hook_configured      = the UE4SS setting that gates the hook attempt.
+	//   signature_ready/address = whether the engine function was resolved.
+	//   detour_object_present = a detour object was allocated/configured.
+	//   pre_callbacks/post_callbacks = the callback is registered in the
+	//     pinned dispatcher vector (present even when hooking is disabled).
+	// None of these fields proves that PolyHook installed the detour, that the
+	// original function is reachable, that the callback was delivered, or why
+	// no '[SnapshotDiag] InitGameState post:' line follows. Install state is
+	// not read here: the polyhook_2 dependency is pinned at
+	// fd2a88f09c8ae89440858fc52573656141013c7f (deps/third-repo/packages/p/
+	// polyhook_2/CMakeLists.txt) but its checkout is not materialized locally,
+	// so no install-state query was verified against the exact pinned headers
+	// and none is used. Pinned to LogLevel::Warning so it survives
+	// MOD_SERVER_LOG_LEVEL=2.
 	const bool lifecycle_loadmap_hook_configured = Unreal::UnrealInitializer::StaticStorage::GlobalConfig.bHookLoadMap;
 	const bool lifecycle_loadmap_detour_object_present = Unreal::Hook::StaticStorage::LoadMapDetour != nullptr;
 	const size_t lifecycle_loadmap_pre_callbacks = Unreal::Hook::StaticStorage::LoadMapPreCallbacks.size();
@@ -331,7 +332,7 @@ auto MotorTownMods::on_unreal_init() -> void
 	const size_t lifecycle_initgamestate_pre_callbacks = Unreal::Hook::StaticStorage::InitGameStatePreCallbacks.size();
 	const size_t lifecycle_initgamestate_post_callbacks = Unreal::Hook::StaticStorage::InitGameStatePostCallbacks.size();
 	ModStatics::LogOutput<LogLevel::Warning>(
-		L"[SnapshotDiag] lifecycle hook status: loadmap hook_configured={} detour_object_present={} pre_callbacks={} post_callbacks={} initgamestate hook_configured={} signature_ready={} signature_address={:#x} detour_object_present={} pre_callbacks={} post_callbacks={} (hook_configured=false or detour_object_present=false means the InitGameState callback can never fire; detour_object_present=true proves only that a detour object exists - the overlay discards hook()'s result, so install success is not observable from this mod)",
+		L"[SnapshotDiag] lifecycle hook status: loadmap hook_configured={} detour_object_present={} pre_callbacks={} post_callbacks={} initgamestate hook_configured={} signature_ready={} signature_address={:#x} detour_object_present={} pre_callbacks={} post_callbacks={} (field semantics: hook_configured=UE4SS config flag, signature_ready/address=engine function resolved, detour_object_present=detour object allocated, pre/post_callbacks=callback registered; none of these proves hook install, callback delivery, or the cause of a missing post line)",
 		lifecycle_loadmap_hook_configured,
 		lifecycle_loadmap_detour_object_present,
 		lifecycle_loadmap_pre_callbacks,

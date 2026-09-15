@@ -473,14 +473,15 @@ class SnapshotRegressionTests(unittest.TestCase):
         # Named failure (review-2 P1): the LoadMap pre notification used to
         # clear only the cached root pair, leaving s_current_world pointing at
         # the OUTGOING world. In the pinned dispatcher (deps/first/Unreal/src/
-        # Hooks.cpp HookedLoadMap) the post-callback loop breaks at the first
-        # callback returning {true, _} and Register* appends, so an earlier
-        # post callback can skip this mod's anchor refresh for that travel.
-        # While the stale anchor stayed live, recovery re-admitted the old
-        # world's root and the serve gate accepted it (cached world == stale
-        # anchor). The fix invalidates cache AND anchor together inside the
-        # pre notification and keeps both callbacks at the FRONT of their
-        # vectors; a skipped post leaves a permanent typed 503 with the
+        # Hooks.cpp HookedLoadMap) each callback loop breaks at the first
+        # callback returning {true, _} and Register* appends, so the post loop
+        # is interruptible in general. While the stale anchor stayed live,
+        # recovery re-admitted the old world's root and the serve gate accepted
+        # it (cached world == stale anchor). The fix invalidates cache AND
+        # anchor together inside the pre notification and rotates this mod's
+        # callback to the FRONT of both vectors, so an earlier-registered peer
+        # cannot end a loop before ours has run; a post notification that still
+        # never reaches this mod leaves a permanent typed 503 with the
         # throttled anchor-missing diagnostic instead of stale state.
         # The compiled half executes the real production gate/recovery logic
         # over the pre/capture/post event sequence; the source half pins the
@@ -541,9 +542,9 @@ class SnapshotRegressionTests(unittest.TestCase):
                         assert(spy.invocations == 0);
                         assert(ResolveServedSnapshotRoot(stale_weak, old_world_weak, nullptr, readable, mode_of, state_of) == nullptr);
                     }
-                    // (3) Post notification skipped: the anchor never returns;
-                    // later captures still refuse. Permanent typed 503 beats
-                    // serving stale state.
+                    // (3) Post notification never delivered to this mod: the
+                    // anchor never returns; later captures still refuse.
+                    // Permanent typed 503 beats serving stale state.
                     {
                         ScanSpy spy; spy.objects = {&stale};
                         const auto decision = RecoverActiveSnapshotRoot<GameState>(true, nullptr, spy, readable, world_of, mode_of, state_of);
@@ -694,10 +695,11 @@ class SnapshotRegressionTests(unittest.TestCase):
         # Normal or stronger. (2) Labeling the PolyHook detour pointer
         # 'detour_installed' overclaims: the pinned overlay assigns the detour
         # object before calling hook() and discards hook()'s result, so the
-        # boot line must use the truthful 'detour_object_present' label and
-        # carry the registration-decision inputs (hook configuration flags,
-        # resolved signature, callback counts) so 'never attempted' and
-        # 'attempted but never fired' are distinguishable.
+        # boot line must use the truthful 'detour_object_present' label. The
+        # reported fields carry the hook configuration flags, resolved
+        # signature and callback counts as their own facts; none of them is a
+        # statement about install, delivery, or the cause of a missing post
+        # line.
         # (3) The one-shot lifecycle status call spans multiple lines, so a
         # line-based check never inspects the line carrying LogOutput and its
         # template argument together; a per-call-site regex is required to

@@ -106,9 +106,13 @@ namespace MotorTown::Snapshot
             // Gameplay-validity per the pinned engine's own internal-flag rule
             // (UnrealFlags.hpp: PendingKill = "invalid for gameplay but valid
             // objects"). FindAllOf does not remove PendingKill objects and only
-            // FWeakObjectPtr::Get rejects them, so every object this module
-            // touches (chain candidates, worlds, authority GameModes, array
-            // elements) is gated on the flag here, before any reflection read.
+            // FWeakObjectPtr::Get rejects them, so this predicate gates the
+            // objects that carry runtime state: recovery candidates, their
+            // worlds and authority GameModes, the cached root/world, top-level
+            // Vehicle/PlayerArray elements, and object-reference targets.
+            // Scope limit: metadata reads that only observe UClass/UStruct
+            // objects (GetClassPrivate(), GetStruct() property-link walks,
+            // IsA<> checks) are NOT individually gated by this predicate.
             return object && !object->IsUnreachable() &&
                    !object->HasAnyInternalFlags(EInternalObjectFlags::PendingKill) &&
                    !object->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed));
@@ -637,11 +641,11 @@ namespace MotorTown::Snapshot
         // here would let recovery re-admit the old world's root during the
         // travel window and let the serve gate accept it (cached world ==
         // stale anchor). If the matching post notification never reaches
-        // this mod (the pinned dispatcher's post loop is interruptible by an
-        // earlier post callback returning {true, _}), the anchor stays null
-        // and every endpoint keeps refusing fail-closed with the typed 503;
-        // the throttled anchor-missing diagnostic below makes that state
-        // observable in UE4SS.log.
+        // this mod for any reason (LoadMap hook not installed, an interrupt in
+        // the pinned dispatcher loop, or a travel that never posts), the
+        // anchor stays null and every endpoint keeps refusing fail-closed with
+        // the typed 503; the throttled anchor-missing diagnostic below makes
+        // that state observable in UE4SS.log.
         std::lock_guard guard{s_mutex};
         s_active_game_state = nullptr;
         s_active_world = nullptr;
@@ -708,10 +712,11 @@ namespace MotorTown::Snapshot
         {
             // Anchor-specific, observable at LogLevel::Normal: a missing
             // anchor is exactly the state a travel sits in between the pre
-            // invalidation and the post refresh, and permanently so when the
-            // post notification is skipped. Fail closed, never serve stale.
+            // invalidation and the post refresh, and permanently so when no
+            // post notification ever reaches this mod. Fail closed, never
+            // serve stale.
             log_snapshot_diag_throttled(L"anchor-missing",
-                L"active root unavailable: current-world anchor missing (LoadMap pre cleared it; post notification not yet delivered, skipped by an earlier post callback, or LoadMap hook inactive)");
+                L"active root unavailable: current-world anchor missing (LoadMap pre cleared it; the matching post notification has not been delivered to this mod, or the LoadMap hook is inactive)");
             return nullptr;
         }
 
@@ -770,9 +775,11 @@ namespace MotorTown::Snapshot
             L" world=" + world->GetName() + L")");
         // Never return a pointer the stored weak root/world cannot resolve:
         // the recovered candidate is served through the exact same weak-cache
-        // gate as every other path (final weak re-resolution), and a late
-        // GC/PendingKill race refuses there. The recovered raw pointer never
-        // escapes this function directly.
+        // gate as every other path (final weak re-resolution). That gate
+        // refuses any weak-serial/unreadable state visible at the check
+        // itself; it does not pin the objects, so a GC or PendingKill that
+        // lands after the check is not modeled here. The recovered raw
+        // pointer never escapes this function directly.
         return serve_cached();
     }
 
