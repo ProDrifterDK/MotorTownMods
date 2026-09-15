@@ -289,14 +289,18 @@ class SnapshotRegressionTests(unittest.TestCase):
         self.assertLess(resolve.index("ResolveActiveSnapshotRoot"), resolve.index("recover_active_game_state()"))
 
     def test_lifecycle_diagnostics_survive_canary_log_level(self):
-        # Named failure this catches: [SnapshotDiag] lines emitted with the
-        # default LogLevel::Default template argument are suppressed at the
-        # frozen canary level (MOD_SERVER_LOG_LEVEL=2), which is why 18 canary
-        # runs produced zero [SnapshotDiag] evidence. Every lifecycle
+        # Named failure this catches: (1) [SnapshotDiag] lines emitted with
+        # the default LogLevel::Default template argument are suppressed at
+        # the frozen canary level (MOD_SERVER_LOG_LEVEL=2), which is why 18
+        # canary runs produced zero [SnapshotDiag] evidence; every lifecycle
         # registration/resolution diagnostic must pin an explicit level of
-        # Normal or stronger, and the boot line must carry detour-install
-        # evidence so 'never installed' and 'installed but never fired' are
-        # distinguishable.
+        # Normal or stronger. (2) Labeling the PolyHook detour pointer
+        # 'detour_installed' overclaims: the pinned overlay assigns the detour
+        # object before calling hook() and discards hook()'s result, so the
+        # boot line must use the truthful 'detour_object_present' label and
+        # carry the registration-decision inputs (hook configuration flags,
+        # resolved signature, callback counts) so 'never attempted' and
+        # 'attempted but never fired' are distinguishable.
         dll = (ROOT / "src/dllmain.cpp").read_text()
         self.assertNotIn('ModStatics::LogOutput(L"[SnapshotDiag]', dll)
         for line in [segment for segment in dll.splitlines() if "[SnapshotDiag]" in segment and "LogOutput" in segment]:
@@ -307,9 +311,20 @@ class SnapshotRegressionTests(unittest.TestCase):
         status = dll.split("[SnapshotDiag] lifecycle hook status", 1)[1]
         self.assertIn("signature_ready", status)
         self.assertIn("signature_address", status)
-        self.assertIn("detour_installed", status)
-        self.assertIn("InitGameStateDetour", dll)
+        # Truthful labeling: the detour pointer proves an object exists, not
+        # that PolyHook installed (hook()'s result is discarded upstream).
+        self.assertIn("detour_object_present", status)
+        self.assertNotIn("detour_installed", dll)
+        # Registration-decision inputs from the pinned overlay config.
+        self.assertIn("hook_configured", status)
+        self.assertIn("GlobalConfig.bHookInitGameState", dll)
+        self.assertIn("GlobalConfig.bHookLoadMap", dll)
+        self.assertIn("#include <Unreal/UnrealInitializer.hpp>", dll)
+        # Callback registration is observable.
+        self.assertIn("LoadMapPreCallbacks", dll)
+        self.assertIn("InitGameStatePreCallbacks", dll)
         self.assertIn("InitGameStatePostCallbacks", dll)
+        self.assertIn("InitGameStateDetour", dll)
         snapshot = (ROOT / "src/snapshot.cpp").read_text()
         self.assertNotIn('ModStatics::LogOutput(L"[SnapshotDiag]', snapshot)
         for line in [segment for segment in snapshot.splitlines() if "[SnapshotDiag]" in segment and "LogOutput" in segment]:
